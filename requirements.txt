@@ -1,0 +1,9 @@
+streamlit
+fastapi
+uvicorn
+transformers
+torch
+sentencepiece
+numpy
+pandas
+python-multipart
