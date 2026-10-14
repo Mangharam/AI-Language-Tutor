@@ -25,3 +25,4 @@ passlib[bcrypt]
 PyJWT
 openai
 google-generativeai
+pwdlib[argon2]
