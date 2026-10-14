@@ -1,0 +1,1201 @@
+import React, { useEffect, useRef, useState } from "react";
+import "./App.css";
+
+const API_BASE = "";
+
+const GREETING = {
+  role: "tutor",
+  reply:
+    "Hello! Write me a sentence in English and I will check your grammar. Try telling me about your day.",
+};
+
+function getUserId() {
+  try {
+    let id = localStorage.getItem("lt_user");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("lt_user", id);
+    }
+    return id;
+  } catch {
+    return "default";
+  }
+}
+
+async function apiFetch(path, options) {
+  return fetch(`${API_BASE}${path}`, options);
+}
+
+async function post(path, body) {
+  const response = await apiFetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Server error ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/* =========================
+   ICONS
+========================= */
+
+function Icon({ name, size = 20 }) {
+  const common = {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.8,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+  };
+
+  const icons = {
+    home: (
+      <>
+        <path d="M3 10.5 12 3l9 7.5" />
+        <path d="M5 9.5V21h14V9.5" />
+        <path d="M9 21v-6h6v6" />
+      </>
+    ),
+    chat: (
+      <>
+        <path d="M20 11.5a7.5 7.5 0 0 1-8 7.5 8.5 8.5 0 0 1-4-.9L4 20l1.2-3.4A7.3 7.3 0 0 1 4 12c0-4.1 3.6-7.5 8-7.5s8 3.1 8 7Z" />
+      </>
+    ),
+    mic: (
+      <>
+        <rect x="8" y="3" width="8" height="12" rx="4" />
+        <path d="M5 11a7 7 0 0 0 14 0" />
+        <path d="M12 18v3" />
+        <path d="M9 21h6" />
+      </>
+    ),
+    practice: (
+      <>
+        <path d="M5 4h14v16H5z" />
+        <path d="m8 9 2 2 4-4" />
+        <path d="M8 15h8" />
+      </>
+    ),
+    review: (
+      <>
+        <path d="M4 6h16" />
+        <path d="M4 12h16" />
+        <path d="M4 18h10" />
+      </>
+    ),
+    chart: (
+      <>
+        <path d="M4 19V5" />
+        <path d="M4 19h16" />
+        <path d="m7 15 3-4 3 2 5-7" />
+      </>
+    ),
+    settings: (
+      <>
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 1.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V22h-2.6v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1-1.8-1.8.1-.1A1.7 1.7 0 0 0 8 17a1.7 1.7 0 0 0-1.5-1H6v-2.6h.5A1.7 1.7 0 0 0 8 12a1.7 1.7 0 0 0-.3-1.9l-.1-.1 1.8-1.8.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V5h2.6v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1 1.8 1.8-.1.1A1.7 1.7 0 0 0 19 10a1.7 1.7 0 0 0 1.5 1h.5v2.6h-.5a1.7 1.7 0 0 0-1.1 1.4Z" />
+      </>
+    ),
+    sun: (
+      <>
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+      </>
+    ),
+    moon: (
+      <path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.7 8.7 0 1 0 20 15.5Z" />
+    ),
+    arrow: (
+      <>
+        <path d="M5 12h14" />
+        <path d="m13 6 6 6-6 6" />
+      </>
+    ),
+    send: (
+      <>
+        <path d="m22 2-7 20-4-9-9-4Z" />
+        <path d="M22 2 11 13" />
+      </>
+    ),
+  };
+
+  return <svg {...common}>{icons[name] || icons.chat}</svg>;
+}
+
+/* =========================
+   PROGRESS
+========================= */
+
+function ProgressCards({ profile }) {
+  if (!profile || !profile.total) {
+    return (
+      <div className="empty-progress">
+        <span className="empty-icon">✦</span>
+        <div>
+          <strong>Your learning journey starts here</strong>
+          <p>Send your first English sentence to start tracking progress.</p>
+        </div>
+      </div>
+    );
+  }
+
+  const lv = profile.levels;
+
+  return (
+    <div className="progress-grid">
+      <div className="stat-card level-card">
+        <div className="stat-top">
+          <span>Overall Level</span>
+          <span className="stat-icon">✦</span>
+        </div>
+        <strong>{lv.overall.cefr}</strong>
+        <div className="mini-progress">
+          <span style={{ width: `${lv.overall.score}%` }} />
+        </div>
+        <small>{lv.overall.score}% progress</small>
+      </div>
+
+      <div className="stat-card">
+        <div className="stat-top">
+          <span>Accuracy</span>
+          <span className="stat-icon">◎</span>
+        </div>
+        <strong>{profile.accuracy}%</strong>
+        <small>Correct first try</small>
+      </div>
+
+      <div className="stat-card">
+        <div className="stat-top">
+          <span>Sentences</span>
+          <span className="stat-icon">⌁</span>
+        </div>
+        <strong>{profile.total}</strong>
+        <small>Total practiced</small>
+      </div>
+
+      <div className="stat-card">
+        <div className="stat-top">
+          <span>Recent Accuracy</span>
+          <span className="stat-icon">↗</span>
+        </div>
+        <strong>{profile.recent_accuracy}%</strong>
+        <small>Last 10 sentences</small>
+      </div>
+    </div>
+  );
+}
+
+/* =========================
+   CORRECTION
+========================= */
+
+function Correction({ msg }) {
+  if (!msg.has_errors) {
+    return (
+      <div className="success-box">
+        <span>✓</span>
+        <div>
+          <strong>Great sentence!</strong>
+          <p>Your grammar looks correct.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="correction-box">
+      <div className="correction-title">
+        <span>AI Correction</span>
+      </div>
+
+      <div className="better-version">
+        <small>Better version</small>
+        <strong>{msg.corrected}</strong>
+      </div>
+
+      {msg.changes?.length > 0 && (
+        <div className="changes-list">
+          {msg.changes.map((c, i) => (
+            <div className="change-item" key={i}>
+              <span className="change-tag">{c.category}</span>
+              {c.type === "add" && (
+                <span>
+                  Add <b>{c.to}</b>
+                </span>
+              )}
+              {c.type === "remove" && (
+                <span>
+                  Remove <s>{c.from}</s>
+                </span>
+              )}
+              {c.type === "replace" && (
+                <span>
+                  <s>{c.from}</s> → <b>{c.to}</b>
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =========================
+   CHAT
+========================= */
+
+function ChatView({
+  messages,
+  input,
+  setInput,
+  send,
+  loading,
+  voice,
+  voiceText,
+  voiceWords,
+  setVoiceText,
+  setVoiceWords,
+}) {
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  return (
+    <div className="workspace chat-workspace">
+      <div className="workspace-header">
+        <div>
+          <div className="eyebrow">AI LANGUAGE COACH</div>
+          <h1>Let's improve your English.</h1>
+          <p>Write naturally. I'll correct your grammar and help you improve.</p>
+        </div>
+
+        <div className="online-badge">
+          <span />
+          AI Online
+        </div>
+      </div>
+
+      <div className="chat-area">
+        {messages.map((m, i) => (
+          <div
+            key={i}
+            className={`message-row ${m.role === "user" ? "user-row" : ""}`}
+          >
+            {m.role === "tutor" && (
+              <div className="avatar tutor-avatar">AI</div>
+            )}
+
+            <div className={`message ${m.role}`}>
+              <div className="message-label">
+                {m.role === "tutor" ? "AI Tutor" : "You"}
+              </div>
+
+              <p>{m.reply}</p>
+
+              {m.role === "tutor" && <Correction msg={m} />}
+
+              {m.highlights?.length > 0 && (
+                <div className="word-highlights">
+                  <small>Strong vocabulary</small>
+                  <div>
+                    {m.highlights.map((h) => (
+                      <span key={h.word}>
+                        {h.word} · {h.cefr}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {m.cards_added > 0 && (
+                <div className="saved-note">
+                  ✓ Saved {m.cards_added} word(s) to Review
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+
+        {loading && (
+          <div className="message-row">
+            <div className="avatar tutor-avatar">AI</div>
+            <div className="message tutor typing">
+              <span />
+              <span />
+              <span />
+            </div>
+          </div>
+        )}
+
+        <div ref={endRef} />
+      </div>
+
+      <div className="composer-wrap">
+        <div className="composer">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && send()}
+            placeholder="Write something in English..."
+            aria-label="Your message" maxLength={500}
+          />
+
+          {voice.engine !== "none" && (
+            <button
+              className={`voice-btn ${
+                voice.status === "recording" ? "recording" : ""
+              }`}
+              onClick={voice.toggle}
+              disabled={voice.status === "processing" || loading}
+              title={
+                voice.status === "recording"
+                  ? "Stop recording"
+                  : "Speak your sentence"
+              }
+            >
+              <Icon name="mic" size={20} />
+            </button>
+          )}
+
+          <button
+            className="send-btn"
+            onClick={send}
+            disabled={loading || !input.trim()}
+          >
+            <Icon name="send" size={19} />
+          </button>
+        </div>
+
+        <div className="voice-status">
+          {voice.status === "recording"
+            ? "● Listening... press the microphone when you're finished."
+            : voice.status === "processing"
+            ? "Converting your speech to text..."
+            : voice.message
+            ? voice.message
+            : voice.engine === "local"
+            ? "Voice powered by Local Whisper"
+            : voice.engine === "browser"
+            ? "Voice powered by browser speech recognition"
+            : "Type your sentence above"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================
+   PRACTICE
+========================= */
+
+function Practice({ userId, onAnswered }) {
+  const [ex, setEx] = useState(null);
+  const [picked, setPicked] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setPicked(null);
+    setResult(null);
+    setError("");
+
+    try {
+      const r = await apiFetch(`/api/exercise/${userId}`);
+      if (!r.ok) throw new Error();
+      setEx(await r.json());
+    } catch {
+      setError("Could not load the exercise.");
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function choose(i) {
+    if (result) return;
+
+    setPicked(i);
+
+    try {
+      const data = await post("/api/exercise/answer", {
+        user_id: userId,
+        exercise_id: ex.id,
+        choice: i,
+      });
+
+      setResult(data);
+      onAnswered?.();
+    } catch {
+      setError("Could not save your answer.");
+    }
+  }
+
+  return (
+    <div className="workspace">
+      <div className="workspace-header">
+        <div>
+          <div className="eyebrow">PRACTICE LAB</div>
+          <h1>Build your grammar skills.</h1>
+          <p>Short exercises designed around your learning level.</p>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="feature-card">
+          <h2>Something went wrong</h2>
+          <p>{error}</p>
+          <button className="primary-btn" onClick={load}>
+            Try again
+          </button>
+        </div>
+      ) : !ex ? (
+        <div className="feature-card loading-card">
+          Loading exercise...
+        </div>
+      ) : (
+        <div className="exercise-card">
+          <div className="exercise-meta">
+            <span>{ex.category}</span>
+            <span>Difficulty: {ex.level}</span>
+          </div>
+
+          <div className="exercise-number">EXERCISE</div>
+          <h2>{ex.question}</h2>
+
+          <div className="options-grid">
+            {ex.options.map((option, i) => {
+              let cls = "";
+
+              if (result && i === result.answer_index) cls = "correct";
+              else if (result && i === picked) cls = "incorrect";
+
+              return (
+                <button
+                  key={i}
+                  className={`answer-option ${cls}`}
+                  onClick={() => choose(i)}
+                  disabled={!!result}
+                >
+                  <span>{String.fromCharCode(65 + i)}</span>
+                  {option}
+                </button>
+              );
+            })}
+          </div>
+
+          {result && (
+            <div className={`result-box ${result.correct ? "correct" : "incorrect"}`}>
+              <strong>{result.correct ? "Excellent!" : "Not quite."}</strong>
+              <p>{result.why}</p>
+
+              <button className="primary-btn" onClick={load}>
+                Next exercise
+                <Icon name="arrow" size={17} />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =========================
+   REVIEW
+========================= */
+
+function Review({ userId }) {
+  const [data, setData] = useState(null);
+  const [input, setInput] = useState("");
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setInput("");
+    setResult(null);
+    setError("");
+
+    try {
+      const r = await apiFetch(`/api/review/${userId}`);
+      if (!r.ok) throw new Error();
+      setData(await r.json());
+    } catch {
+      setError("Could not load your review cards.");
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function check() {
+    if (!input.trim() || result) return;
+
+    try {
+      setResult(
+        await post("/api/review/answer", {
+          user_id: userId,
+          card_id: data.card.id,
+          answer: input,
+        })
+      );
+    } catch {
+      setError("Could not save your answer.");
+    }
+  }
+
+  return (
+    <div className="workspace">
+      <div className="workspace-header">
+        <div>
+          <div className="eyebrow">SMART REVIEW</div>
+          <h1>Remember what you learned.</h1>
+          <p>Review difficult words and strengthen your vocabulary.</p>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="feature-card">
+          <h2>Something went wrong</h2>
+          <p>{error}</p>
+          <button className="primary-btn" onClick={load}>
+            Try again
+          </button>
+        </div>
+      ) : !data ? (
+        <div className="feature-card loading-card">Loading review...</div>
+      ) : !data.card ? (
+        <div className="empty-review">
+          <div className="empty-review-icon">✓</div>
+          <h2>{data.total_cards ? "You're all caught up!" : "No review words yet"}</h2>
+          <p>
+            {data.total_cards
+              ? "Come back later. Your next review will appear here."
+              : "Words you miss during practice will automatically appear here."}
+          </p>
+          <button className="primary-btn" onClick={load}>
+            Check again
+          </button>
+        </div>
+      ) : (
+        <div className="review-card">
+          <div className="review-count">
+            {data.due_count} word{data.due_count === 1 ? "" : "s"} due
+          </div>
+
+          <div className="review-icon">Aa</div>
+
+          <h2>{data.card.sentence}</h2>
+
+          <p className="hint">
+            Hint: starts with <strong>{data.card.hint}</strong>
+          </p>
+
+          <div className="review-input">
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && check()}
+              placeholder="Type the missing word..."
+              disabled={!!result}
+              autoFocus
+            />
+
+            <button
+              onClick={check}
+              disabled={!input.trim() || !!result}
+            >
+              Check
+            </button>
+          </div>
+
+          {result && (
+            <div className="result-box">
+              <strong>{result.correct ? "Correct!" : "Keep practicing!"}</strong>
+              <p>
+                The word is <b>{result.answer}</b>.{" "}
+                {result.correct
+                  ? `Next review in ${result.next_review_days} day(s).`
+                  : "You'll see it again in 10 minutes."}
+              </p>
+
+              <button className="primary-btn" onClick={load}>
+                Next card
+                <Icon name="arrow" size={17} />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* =========================
+   VOICE ENGINE
+========================= */
+
+const MAX_RECORD_MS = 30000;
+
+function useVoice(onResult) {
+  const [engine, setEngine] = useState("none");
+  const [status, setStatus] = useState("idle");
+  const [message, setMessage] = useState("");
+
+  const recorder = useRef(null);
+  const timer = useRef(null);
+  const recognition = useRef(null);
+
+  useEffect(() => {
+    const Browser =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (Browser) setEngine("browser");
+
+    apiFetch("/api/health")
+      .then((r) => {
+        if (!r.ok) throw new Error();
+        return r.json();
+      })
+      .then(() => {
+        if (
+          window.MediaRecorder &&
+          navigator.mediaDevices?.getUserMedia
+        ) {
+          setEngine("local");
+        } else if (Browser) {
+          setEngine("browser");
+        }
+      })
+      .catch(() => {
+        if (
+          window.MediaRecorder &&
+          navigator.mediaDevices?.getUserMedia
+        ) {
+          setEngine("local");
+        } else if (Browser) {
+          setEngine("browser");
+        }
+      });
+  }, []);
+
+  async function startLocal() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
+
+      const mimeType =
+        [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/ogg;codecs=opus",
+        ].find((t) => MediaRecorder.isTypeSupported(t)) || "";
+
+      const rec = new MediaRecorder(
+        stream,
+        mimeType ? { mimeType } : undefined
+      );
+
+      const chunks = [];
+
+      rec.ondataavailable = (e) => {
+        if (e.data.size) chunks.push(e.data);
+      };
+
+      rec.onstop = async () => {
+        clearTimeout(timer.current);
+
+        stream.getTracks().forEach((t) => t.stop());
+
+        setStatus("processing");
+
+        try {
+          const blob = new Blob(chunks, {
+            type: rec.mimeType,
+          });
+
+          const formData = new FormData();
+
+          const extension = rec.mimeType.includes("ogg")
+            ? "ogg"
+            : "webm";
+
+          formData.append(
+            "file",
+            blob,
+            `recording.${extension}`
+          );
+
+          const res = await apiFetch("/api/transcribe", {
+            method: "POST",
+            body: formData,
+          });
+
+          const data = await res.json();
+
+          if (!res.ok) {
+            throw new Error(
+              data.detail || "Transcription failed"
+            );
+          }
+
+          if (!data.transcript) {
+            setMessage(
+              "I could not hear anything. Please try again."
+            );
+          } else {
+            setMessage("");
+            onResult(data.transcript, data.words);
+          }
+        } catch (err) {
+          setMessage(String(err.message || err));
+        } finally {
+          setStatus("idle");
+        }
+      };
+
+      rec.start();
+
+      recorder.current = rec;
+      setStatus("recording");
+      setMessage("");
+
+      timer.current = setTimeout(() => {
+        if (rec.state === "recording") rec.stop();
+      }, MAX_RECORD_MS);
+    } catch {
+      setMessage(
+        "Microphone blocked. Allow microphone access in your browser."
+      );
+      setStatus("idle");
+    }
+  }
+
+  function startBrowser() {
+    const Browser =
+      window.SpeechRecognition ||
+      window.webkitSpeechRecognition;
+
+    if (!Browser) {
+      setMessage("Speech recognition is not supported.");
+      return;
+    }
+
+    const rec = new Browser();
+
+    rec.lang = "en-US";
+    rec.interimResults = false;
+
+    rec.onresult = (e) => {
+      setMessage("");
+      onResult(e.results[0][0].transcript, null);
+    };
+
+    rec.onerror = (e) => {
+      setMessage(
+        e.error === "not-allowed"
+          ? "Microphone blocked. Allow microphone access."
+          : `Speech recognition error: ${e.error}`
+      );
+    };
+
+    rec.onend = () => setStatus("idle");
+
+    recognition.current = rec;
+
+    setMessage("");
+    setStatus("recording");
+
+    rec.start();
+  }
+
+  function toggle() {
+    if (status === "processing") return;
+
+    if (status === "recording") {
+      if (engine === "local") {
+        recorder.current?.stop();
+      } else {
+        recognition.current?.stop();
+      }
+
+      return;
+    }
+
+    if (engine === "local") {
+      startLocal();
+    } else {
+      startBrowser();
+    }
+  }
+
+  return {
+    engine,
+    status,
+    message,
+    toggle,
+  };
+}
+
+/* =========================
+   APP
+========================= */
+
+export default function App() {
+  const [userId] = useState(getUserId);
+
+  const [messages, setMessages] = useState([GREETING]);
+  const [input, setInput] = useState("");
+
+  const [loading, setLoading] = useState(false);
+  const [profile, setProfile] = useState(null);
+
+  const [tab, setTab] = useState("chat");
+  const [theme, setTheme] = useState(
+    localStorage.getItem("lt_theme") || "dark"
+  );
+
+  const [voiceWords, setVoiceWords] = useState(null);
+  const [voiceText, setVoiceText] = useState("");
+
+  const voice = useVoice((text, words) => {
+    setInput(text);
+    setVoiceText(text);
+    setVoiceWords(words);
+  });
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("lt_theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    apiFetch(`/api/profile/${userId}`)
+      .then((r) => r.json())
+      .then(setProfile)
+      .catch(() => {});
+  }, [userId]);
+
+  function refreshProfile() {
+    apiFetch(`/api/profile/${userId}`)
+      .then((r) => r.json())
+      .then(setProfile)
+      .catch(() => {});
+  }
+
+  async function send() {
+    const text = input.trim();
+
+    if (!text || loading) return;
+
+    setMessages((m) => [
+      ...m,
+      {
+        role: "user",
+        reply: text,
+      },
+    ]);
+
+    setInput("");
+    setVoiceWords(null);
+    setVoiceText("");
+    setLoading(true);
+
+    try {
+      const res = await apiFetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: text,
+          user_id: userId,
+          speech_words:
+            text === voiceText ? voiceWords : null,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Server error ${res.status}`);
+      }
+
+      const data = await res.json();
+
+      setProfile(data.profile);
+
+      setMessages((m) => [
+        ...m,
+        {
+          role: "tutor",
+          ...data,
+        },
+      ]);
+    } catch {
+      setMessages((m) => [
+        ...m,
+        {
+          role: "tutor",
+          reply:
+            "I could not reach the server. Please make sure the backend is running on port 8000.",
+        },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function resetProgress() {
+    const confirmed = window.confirm(
+      "Are you sure you want to reset your learning progress?"
+    );
+
+    if (!confirmed) return;
+
+    const res = await apiFetch(`/api/profile/${userId}`, {
+      method: "DELETE",
+    });
+
+    setProfile(await res.json());
+  }
+
+  const navigation = [
+    {
+      id: "dashboard",
+      label: "Dashboard",
+      icon: "home",
+    },
+    {
+      id: "chat",
+      label: "AI Tutor",
+      icon: "chat",
+    },
+    {
+      id: "speaking",
+      label: "Speaking",
+      icon: "mic",
+    },
+    {
+      id: "practice",
+      label: "Practice",
+      icon: "practice",
+    },
+    {
+      id: "review",
+      label: "Review",
+      icon: "review",
+    },
+  ];
+
+  function selectTab(id) {
+    if (id === "dashboard") {
+      setTab("dashboard");
+    } else if (id === "speaking") {
+      setTab("chat");
+    } else {
+      setTab(id);
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">L</div>
+          <div>
+            <strong>LinguaAI</strong>
+            <span>Language Coach</span>
+          </div>
+        </div>
+
+        <div className="sidebar-label">LEARN</div>
+
+        <nav className="navigation">
+          {navigation.map((item) => {
+            const active =
+              item.id === "speaking"
+                ? tab === "chat"
+                : tab === item.id;
+
+            return (
+              <button
+                key={item.id}
+                className={`nav-item ${active ? "active" : ""}`}
+                onClick={() => selectTab(item.id)}
+              >
+                <Icon name={item.icon} size={19} />
+                <span>{item.label}</span>
+
+                {item.id === "chat" && (
+                  <span className="nav-dot" />
+                )}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="sidebar-bottom">
+          <button className="nav-item">
+            <Icon name="settings" size={19} />
+            <span>Settings</span>
+          </button>
+
+          <button
+            className="theme-switch"
+            onClick={() =>
+              setTheme(theme === "dark" ? "light" : "dark")
+            }
+          >
+            <span>
+              <Icon
+                name={theme === "dark" ? "sun" : "moon"}
+                size={18}
+              />
+              {theme === "dark" ? "Light mode" : "Dark mode"}
+            </span>
+
+            <div className="switch">
+              <div />
+            </div>
+          </button>
+
+          <div className="profile-mini">
+            <div className="profile-avatar">M</div>
+            <div>
+              <strong>My Learning</strong>
+              <span>
+                {profile?.levels?.overall?.cefr || "A1"} learner
+              </span>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <main className="main-content">
+        <header className="topbar">
+          <div className="mobile-brand">
+            <div className="brand-mark">L</div>
+            <strong>LinguaAI</strong>
+          </div>
+
+          <div className="topbar-right">
+            <div className="streak">
+              <span>✦</span>
+              <div>
+                <strong>{profile?.total || 0}</strong>
+                <small>sentences</small>
+              </div>
+            </div>
+
+            <button
+              className="top-theme"
+              onClick={() =>
+                setTheme(theme === "dark" ? "light" : "dark")
+              }
+            >
+              <Icon
+                name={theme === "dark" ? "sun" : "moon"}
+                size={18}
+              />
+            </button>
+          </div>
+        </header>
+
+        {tab === "dashboard" ? (
+          <div className="dashboard-view">
+            <div className="workspace-header dashboard-heading">
+              <div>
+                <div className="eyebrow">YOUR PROGRESS</div>
+                <h1>Welcome back. 👋</h1>
+                <p>
+                  Keep practicing and your English will get stronger
+                  every day.
+                </p>
+              </div>
+            </div>
+
+            <ProgressCards profile={profile} />
+
+            <div className="dashboard-grid">
+              <div className="dashboard-feature">
+                <div className="feature-glow" />
+                <div className="feature-content">
+                  <span className="feature-label">
+                    RECOMMENDED FOR YOU
+                  </span>
+
+                  <h2>
+                    Practice speaking
+                    <br />
+                    with your AI tutor.
+                  </h2>
+
+                  <p>
+                    Speak naturally and get instant feedback on your
+                    English.
+                  </p>
+
+                  <button
+                    className="primary-btn"
+                    onClick={() => setTab("chat")}
+                  >
+                    Start speaking
+                    <Icon name="arrow" size={17} />
+                  </button>
+                </div>
+
+                <div className="feature-orb">
+                  <Icon name="mic" size={50} />
+                </div>
+              </div>
+
+              <div className="quick-card">
+                <div className="quick-icon">
+                  <Icon name="practice" size={22} />
+                </div>
+                <span>Quick practice</span>
+                <h3>Test your grammar</h3>
+                <p>Take a short exercise based on your level.</p>
+                <button onClick={() => setTab("practice")}>
+                  Practice <Icon name="arrow" size={16} />
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : tab === "chat" ? (
+          <ChatView
+            messages={messages}
+            input={input}
+            setInput={setInput}
+            send={send}
+            loading={loading}
+            voice={voice}
+            voiceText={voiceText}
+            voiceWords={voiceWords}
+            setVoiceText={setVoiceText}
+            setVoiceWords={setVoiceWords}
+          />
+        ) : tab === "practice" ? (
+          <Practice
+            userId={userId}
+            onAnswered={refreshProfile}
+          />
+        ) : tab === "review" ? (
+          <Review userId={userId} />
+        ) : null}
+      </main>
+    </div>
+  );
+}

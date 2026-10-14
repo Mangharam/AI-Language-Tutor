@@ -1,0 +1,160 @@
+import { useEffect, useState } from "react";
+
+const CEFR_BANDS = [["A1", 0], ["A2", 17], ["B1", 34], ["B2", 51], ["C1", 68], ["C2", 84]];
+const PRON_BANDS = [["Needs work", 0], ["Developing", 60], ["Clear", 75], ["Very clear", 90]];
+
+function speak(word) {
+  if (!window.speechSynthesis) return;
+  const u = new SpeechSynthesisUtterance(word);
+  u.lang = "en-US";
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(u);
+}
+
+/* Shown under a tutor reply when the sentence was spoken. */
+export function PronunciationFeedback({ data }) {
+  if (!data) return null;
+  return (
+    <div className="pron">
+      <p className="pron-head">Pronunciation clarity: <b>{data.score}%</b> <span className="tag">{data.band}</span></p>
+      <p className="pron-words">
+        {data.words.map((w, i) => (
+          <span key={i} className={"pw " + w.status} title={Math.round(w.confidence * 100) + "% clear"}>{w.word} </span>
+        ))}
+      </p>
+      {data.to_practice.length > 0 && (
+        <p className="pron-help">
+          Repeat these:{" "}
+          {data.to_practice.map((w) => (
+            <button key={w} className="hear" onClick={() => speak(w)} aria-label={"Hear the word " + w}>Hear {w}</button>
+          ))}
+        </p>
+      )}
+      <p className="pron-note">Wavy underline means unclear, dotted means partly clear. This shows how clearly the speech recognizer understood you. It is not an accent score.</p>
+    </div>
+  );
+}
+
+function LineChart({ series, bands, label }) {
+  const W = 640, H = 230, L = 74, R = 14, T = 12, B = 30;
+  const n = Math.max(...series.map((s) => s.values.length));
+  const x = (i) => L + (n === 1 ? (W - L - R) / 2 : (i / (n - 1)) * (W - L - R));
+  const y = (v) => T + (1 - v / 100) * (H - T - B);
+  return (
+    <>
+      <p className="legend">
+        {series.map((s) => (
+          <span key={s.name} className="lg">
+            <svg width="30" height="8" aria-hidden="true"><line x1="0" x2="30" y1="4" y2="4" className={"line " + s.cls} strokeDasharray={s.dash} /></svg>
+            {s.name}
+          </span>
+        ))}
+      </p>
+      <svg viewBox={`0 0 ${W} ${H}`} className="chart" role="img" aria-label={label}>
+        {bands.map(([name, v]) => (
+          <g key={name}>
+            <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} className="grid" />
+            <text x={L - 8} y={y(v) + 4} textAnchor="end" className="axis">{name}</text>
+          </g>
+        ))}
+        {series.map((s) => {
+          const pts = s.values.map((v, i) => [x(i), y(v)]);
+          return (
+            <g key={s.name}>
+              <polyline points={pts.map((p) => p.join(",")).join(" ")} fill="none" className={"line " + s.cls} strokeDasharray={s.dash} />
+              {pts.length === 1 && <circle cx={pts[0][0]} cy={pts[0][1]} r="4" className={"dot " + s.cls} />}
+            </g>
+          );
+        })}
+        <text x={(L + W - R) / 2} y={H - 6} textAnchor="middle" className="axis">Sentence number (oldest to newest)</text>
+      </svg>
+    </>
+  );
+}
+
+function BarRow({ label, value, max, text }) {
+  return (
+    <div className="barrow">
+      <span className="barrow-label">{label}</span>
+      <div className="barrow-track"><div className="barrow-fill" style={{ width: (max ? (100 * value) / max : 0) + "%" }} /></div>
+      <span className="barrow-text">{text}</span>
+    </div>
+  );
+}
+
+export default function Dashboard({ userId, apiFetch }) {
+  const [d, setD] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (apiFetch || fetch)("/api/dashboard/" + userId)
+      .then((r) => { if (!r.ok) throw new Error(); return r.json(); })
+      .then(setD)
+      .catch(() => setError("Could not load your dashboard. Check that the backend is running."));
+  }, [userId]);
+
+  if (error) return <div className="panel"><p>{error}</p></div>;
+  if (!d) return <div className="panel"><p className="muted">Loading dashboard...</p></div>;
+  if (!d.totals.sentences) {
+    return <div className="panel"><h2 className="question">No data yet</h2><p className="muted">Write or say a few sentences in the Chat tab, then come back to see your progress.</p></div>;
+  }
+
+  const t = d.totals, p = d.pronunciation, maxErr = Math.max(1, ...d.errors.map((e) => e.count));
+  return (
+    <div className="panel dash">
+      <div className="tiles">
+        <div className="tile"><b>{t.sentences}</b><span>Sentences</span></div>
+        <div className="tile"><b>{t.accuracy}%</b><span>Correct first try</span></div>
+        <div className="tile"><b>{t.days_practiced}</b><span>Days practiced</span></div>
+        <div className="tile"><b>{t.voice_sentences}</b><span>Spoken sentences</span></div>
+        <div className="tile"><b>{p.average == null ? "-" : p.average + "%"}</b><span>Pronunciation clarity</span></div>
+        <div className="tile"><b>{d.review.mastered}/{d.review.total}</b><span>Review words learned</span></div>
+      </div>
+
+      <h3>Level over time</h3>
+      {d.levels.length > 0 ? (
+        <LineChart
+          label="Grammar, vocabulary and overall level over time"
+          bands={CEFR_BANDS}
+          series={[
+            { name: "Grammar", values: d.levels.map((l) => l.grammar), cls: "s1", dash: "" },
+            { name: "Vocabulary", values: d.levels.map((l) => l.vocab), cls: "s2", dash: "6 4" },
+            { name: "Overall", values: d.levels.map((l) => l.overall), cls: "s3", dash: "2 3" },
+          ]}
+        />
+      ) : <p className="muted">Levels appear after your first sentence of 3 words or more.</p>}
+
+      <h3>Your most common mistakes</h3>
+      {d.errors.length ? d.errors.slice(0, 6).map((e) => (
+        <BarRow key={e.category} label={e.category} value={e.count} max={maxErr} text={e.count} />
+      )) : <p className="muted">No mistakes recorded yet.</p>}
+
+      <h3>Practice accuracy</h3>
+      {d.practice.length ? d.practice.map((e) => (
+        <BarRow key={e.category} label={e.category} value={e.right} max={e.total} text={Math.round((100 * e.right) / e.total) + "% of " + e.total} />
+      )) : <p className="muted">Do some exercises in the Practice tab to see accuracy by topic.</p>}
+
+      <h3>Pronunciation clarity</h3>
+      {p.trend.length === 0 && <p className="muted">Press Speak in the Chat tab and say a sentence. Your clarity score and the words to practice appear here.</p>}
+      {p.trend.length > 0 && (
+        <>
+          <p className="muted">Average {p.average}% ({p.band}).</p>
+          <LineChart label="Pronunciation clarity over time" bands={PRON_BANDS} series={[{ name: "Clarity", values: p.trend, cls: "s1", dash: "" }]} />
+          {p.words.length > 0 && (
+            <>
+              <h4>Words to practice</h4>
+              <ul className="wordlist">
+                {p.words.map((w) => (
+                  <li key={w.word}>
+                    <b>{w.word}</b> <span className="muted">{Math.round(w.avg * 100)}% clear, heard {w.count}x</span>
+                    <button className="hear" onClick={() => speak(w.word)} aria-label={"Hear the word " + w.word}>Hear it</button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,469 @@
+import React, { useState, useRef, useEffect } from "react";
+
+const GREETING = {
+  role: "tutor",
+  reply: "Hello! Write me a sentence in English and I will check your grammar. Try telling me about your day.",
+};
+
+function getUserId() {
+  try {
+    let id = localStorage.getItem("lt_user");
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem("lt_user", id);
+    }
+    return id;
+  } catch {
+    return "default";
+  }
+}
+
+function Correction({ msg }) {
+  if (!msg.has_errors) return null;
+  return (
+    <div className="correction">
+      <p className="correction-label">Better version</p>
+      <p className="correction-text">{msg.corrected}</p>
+      <ul className="changes">
+        {msg.changes.map((c, i) => (
+          <li key={i}>
+            <span className="tag">{c.category}</span>
+            {c.type === "add" && <> Add <b>{c.to}</b></>}
+            {c.type === "remove" && <> Remove <s>{c.from}</s></>}
+            {c.type === "replace" && <> <s>{c.from}</s> becomes <b>{c.to}</b></>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function LevelCard({ label, level, delta }) {
+  return (
+    <div className="level">
+      <span className="level-label">{label}</span>
+      <b className="level-cefr">{level.cefr}</b>
+      <div className="bar" role="img" aria-label={label + " level " + level.cefr}>
+        <div className="bar-fill" style={{ width: level.score + "%" }} />
+      </div>
+      {delta ? <small className={delta > 0 ? "up" : "down"}>{delta > 0 ? "+" : ""}{delta} last sentence</small> : <small>&nbsp;</small>}
+    </div>
+  );
+}
+
+function Progress({ profile, deltas, onReset }) {
+  if (!profile || !profile.total) {
+    return <p className="progress empty">Your level and progress will appear here after your first sentence.</p>;
+  }
+  const lv = profile.levels;
+  return (
+    <section className="progress">
+      <div className="levels">
+        <LevelCard label="Grammar" level={lv.grammar} delta={deltas?.grammar} />
+        <LevelCard label="Vocabulary" level={lv.vocab} delta={deltas?.vocab} />
+        <LevelCard label="Overall" level={lv.overall} />
+      </div>
+      {lv.provisional && <p className="note">Estimate only. Write at least 5 sentences for a steadier level.</p>}
+      <div className="stats">
+        <div><b>{profile.total}</b><span>Sentences</span></div>
+        <div><b>{profile.accuracy}%</b><span>Correct first try</span></div>
+        <div><b>{profile.recent_accuracy}%</b><span>Last 10 sentences</span></div>
+      </div>
+      {profile.weak_areas.length > 0 && (
+        <p className="weak">
+          Practice more:{" "}
+          {profile.weak_areas.map((w) => (
+            <span key={w.category} className="tag">{w.category} ({w.count})</span>
+          ))}
+        </p>
+      )}
+      <button className="link" onClick={onReset}>Reset progress</button>
+    </section>
+  );
+}
+
+function Highlights({ items }) {
+  if (!items || !items.length) return null;
+  return (
+    <p className="highlights">
+      Strong words: {items.map((h) => <span key={h.word} className="tag gold">{h.word} ({h.cefr})</span>)}
+    </p>
+  );
+}
+
+const API_BASE = "http://127.0.0.1:8000";
+
+function apiUrl(path) {
+  return `${API_BASE}${path}`;
+}
+
+async function apiFetch(path, options) {
+  return fetch(apiUrl(path), options);
+}
+
+function post(url, body) {
+  return apiFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => {
+    if (!r.ok) throw new Error("Server error " + r.status);
+    return r.json();
+  });
+}
+
+function Practice({ userId, onAnswered }) {
+  const [ex, setEx] = useState(null);
+  const [picked, setPicked] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setPicked(null); setResult(null); setError("");
+    try {
+      const r = await apiFetch("/api/exercise/" + userId);
+      if (!r.ok) throw new Error();
+      setEx(await r.json());
+    } catch {
+      setError("Could not load an exercise. Check that the backend is running.");
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function choose(i) {
+    if (result) return;
+    setPicked(i);
+    try {
+      setResult(await post("/api/exercise/answer", { user_id: userId, exercise_id: ex.id, choice: i }));
+      onAnswered?.();
+    } catch {
+      setError("Could not save your answer.");
+    }
+  }
+
+  if (error) return <div className="panel"><p>{error}</p><button className="primary" onClick={load}>Try again</button></div>;
+  if (!ex) return <div className="panel"><p className="muted">Loading exercise...</p></div>;
+  return (
+    <div className="panel">
+      <p className="meta">Focus: <span className="tag">{ex.category}</span> Difficulty: {ex.level}</p>
+      <h2 className="question">{ex.question}</h2>
+      <div className="options">
+        {ex.options.map((o, i) => {
+          let cls = "option";
+          if (result && i === result.answer_index) cls += " right";
+          else if (result && i === picked) cls += " wrong";
+          return <button key={i} className={cls} onClick={() => choose(i)} disabled={!!result}>{o}</button>;
+        })}
+      </div>
+      {result && (
+        <div className="feedback">
+          <p><b>{result.correct ? "Correct." : "Not quite."}</b> {result.why}</p>
+          <button className="primary" onClick={load}>Next exercise</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Review({ userId }) {
+  const [data, setData] = useState(null);
+  const [input, setInput] = useState("");
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setInput(""); setResult(null); setError("");
+    try {
+      const r = await apiFetch("/api/review/" + userId);
+      if (!r.ok) throw new Error();
+      setData(await r.json());
+    } catch {
+      setError("Could not load your review cards. Check that the backend is running.");
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function check() {
+    if (!input.trim() || result) return;
+    try {
+      setResult(await post("/api/review/answer", { user_id: userId, card_id: data.card.id, answer: input }));
+    } catch {
+      setError("Could not save your answer.");
+    }
+  }
+
+  if (error) return <div className="panel"><p>{error}</p><button className="primary" onClick={load}>Try again</button></div>;
+  if (!data) return <div className="panel"><p className="muted">Loading...</p></div>;
+  if (!data.card) {
+    return (
+      <div className="panel">
+        <h2 className="question">{data.total_cards ? "Nothing due right now" : "No review words yet"}</h2>
+        <p className="muted">
+          {data.total_cards
+            ? "Come back later. Words you miss return in 10 minutes, and words you know return after a day or more."
+            : "When the tutor fixes a wrong word or a spelling mistake in the Chat tab, the correct word is saved here for review."}
+        </p>
+        <button className="primary" onClick={load}>Check again</button>
+      </div>
+    );
+  }
+  return (
+    <div className="panel">
+      <p className="meta">{data.due_count} due. Type the missing word.</p>
+      <h2 className="question">{data.card.sentence}</h2>
+      <p className="muted">Hint: starts with {data.card.hint}</p>
+      <div className="composer">
+        <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && check()}
+               placeholder="Missing word" aria-label="Missing word" disabled={!!result} autoFocus />
+        <button onClick={check} disabled={!input.trim() || !!result}>Check</button>
+      </div>
+      {result && (
+        <div className="feedback">
+          <p><b>{result.correct ? "Correct." : "Not quite."}</b> The word is <b>{result.answer}</b>.{" "}
+            {result.correct ? "Next review in " + result.next_review_days + " day(s)." : "You will see it again in 10 minutes."}</p>
+          <button className="primary" onClick={load}>Next card</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const MAX_RECORD_MS = 30000;
+
+// Voice input: Google Speech-to-Text through the backend when configured,
+// otherwise the browser's built-in speech recognition (Chrome or Edge).
+function useVoice(onResult) {
+  const [engine, setEngine] = useState("none"); // google | browser | none
+  const [status, setStatus] = useState("idle"); // idle | recording | processing
+  const [message, setMessage] = useState("");
+  const recorder = useRef(null);
+  const timer = useRef(null);
+  const recognition = useRef(null);
+
+  useEffect(() => {
+    // Detect browser speech immediately so the Speak button is not hidden
+    // just because the backend health request is temporarily unavailable.
+    const Browser = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (Browser) setEngine("browser");
+    else setEngine("none");
+
+// Check backend, but always use browser speech recognition when available.
+apiFetch("/api/health")
+  .then((r) => {
+    if (!r.ok) throw new Error("health " + r.status);
+    return r.json();
+  })
+  .then(() => {
+    if (window.MediaRecorder && navigator.mediaDevices?.getUserMedia) {
+      setEngine("local");
+    } else if (Browser) {
+      setEngine("browser");
+    } else {
+      setEngine("none");
+    }
+  })
+  .catch(() => {
+    if (window.MediaRecorder && navigator.mediaDevices?.getUserMedia) {
+      setEngine("local");
+    } else if (Browser) {
+      setEngine("browser");
+    } else {
+      setEngine("none");
+    }
+  });
+
+}, []);
+  async function startGoogle() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType =
+      ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]
+    .find((t) => MediaRecorder.isTypeSupported(t)) || "";
+      const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const chunks = [];
+      rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+      rec.onstop = async () => {
+        clearTimeout(timer.current);
+        stream.getTracks().forEach((t) => t.stop());
+        setStatus("processing");
+        try {
+          const blob = new Blob(chunks, { type: rec.mimeType });
+          const formData = new FormData();
+          const extension = rec.mimeType.includes("ogg") ? "ogg" : "webm";
+          formData.append("file", blob, `recording.${extension}`);  
+
+          const res = await apiFetch("/api/transcribe", {
+          method: "POST",
+          body: formData
+        });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Transcription failed");
+          if (!data.transcript) setMessage("I could not hear anything. Try again closer to the microphone.");
+          else { setMessage(""); onResult(data.transcript, data.words); }
+        } catch (err) {
+          setMessage(String(err.message || err));
+        } finally {
+          setStatus("idle");
+        }
+      };
+      rec.start();
+      recorder.current = rec;
+      setStatus("recording");
+      setMessage("");
+      timer.current = setTimeout(() => rec.state === "recording" && rec.stop(), MAX_RECORD_MS);
+    } catch {
+      setMessage("Microphone blocked. Allow microphone access in the browser address bar.");
+      setStatus("idle");
+    }
+  }
+
+  function startBrowser() {
+    const Browser = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new Browser();
+    rec.lang = "en-US";
+    rec.interimResults = false;
+    rec.onresult = (e) => { setMessage(""); onResult(e.results[0][0].transcript, null); };
+    rec.onerror = (e) => setMessage(e.error === "not-allowed" ? "Microphone blocked. Allow microphone access in the browser address bar." : "Speech recognition error: " + e.error);
+    rec.onend = () => setStatus("idle");
+    recognition.current = rec;
+    setMessage("");
+    setStatus("recording");
+    rec.start();
+  }
+
+  function toggle() {
+    if (status === "processing") return;
+    if (status === "recording") {
+      if (engine === "google") recorder.current?.stop();
+      else recognition.current?.stop();
+      return;
+    }
+    engine === "local" ? startGoogle() : startBrowser();
+  }
+
+  return { engine, status, message, toggle };
+}
+
+export default function App() {
+  const [userId] = useState(getUserId);
+  const [messages, setMessages] = useState([GREETING]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [profile, setProfile] = useState(null);
+  const [deltas, setDeltas] = useState(null);
+  const [tab, setTab] = useState("chat");
+  const endRef = useRef(null);
+  const [voiceWords, setVoiceWords] = useState(null);
+  const [voiceText, setVoiceText] = useState("");
+  const voice = useVoice((text, words) => { setInput(text); setVoiceText(text); setVoiceWords(words); });
+
+  useEffect(() => {
+    apiFetch("/api/profile/" + userId).then((r) => r.json()).then(setProfile).catch(() => {});
+  }, [userId]);
+
+  function refreshProfile() {
+    apiFetch("/api/profile/" + userId).then((r) => r.json()).then(setProfile).catch(() => {});
+  }
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  async function send() {
+    const text = input.trim();
+    if (!text || loading) return;
+    setMessages((m) => [...m, { role: "user", reply: text }]);
+    setInput("");
+    setVoiceWords(null);
+    setVoiceText("");
+    setLoading(true);
+    try {
+      const res = await apiFetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, user_id: userId, speech_words: text === voiceText ? voiceWords : null }),
+      });
+      if (!res.ok) throw new Error("Server error " + res.status);
+      const data = await res.json();
+      setProfile(data.profile);
+      setDeltas(data.deltas);
+      setMessages((m) => [...m, { role: "tutor", ...data }]);
+    } catch {
+      setMessages((m) => [
+        ...m,
+        { role: "tutor", reply: "I could not reach the server. Check that the backend is running on port 8000." },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function resetProgress() {
+    const res = await apiFetch("/api/profile/" + userId, { method: "DELETE" });
+    setProfile(await res.json());
+    setDeltas(null);
+  }
+
+  return (
+    <main className="app">
+      <header className="top">
+        <h1>Language Tutor</h1>
+        <p>English practice with instant grammar feedback</p>
+      </header>
+
+      <Progress profile={profile} deltas={deltas} onReset={resetProgress} />
+
+      <nav className="tabs" role="tablist">
+        {[["chat", "Chat"], ["practice", "Practice"], ["review", "Review"]].map(([id, label]) => (
+          <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? "tab active" : "tab"} onClick={() => setTab(id)}>{label}</button>
+        ))}
+      </nav>
+
+      {tab === "chat" && (
+        <>
+        <section className="chat" aria-live="polite">
+          {messages.map((m, i) => (
+            <div key={i} className={"bubble " + m.role}>
+              <p>{m.reply}</p>
+              {m.role === "tutor" && <Correction msg={m} />}
+              {m.role === "tutor" && <Highlights items={m.highlights} />}
+              {m.cards_added > 0 && <p className="highlights">Saved {m.cards_added} word(s) to your Review tab.</p>}
+            </div>
+          ))}
+          {loading && <div className="bubble tutor muted">Checking your sentence...</div>}
+          <div ref={endRef} />
+        </section>
+
+        <div className="composer">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && send()}
+            placeholder="Write a sentence in English"
+            aria-label="Your message"
+          />
+          {voice.engine !== "none" && (
+            <button className={"mic" + (voice.status === "recording" ? " live" : "")} onClick={voice.toggle}
+                    disabled={voice.status === "processing" || loading}
+                    aria-label={voice.status === "recording" ? "Stop recording" : "Record your voice"}>
+              {voice.status === "recording" ? "Stop" : voice.status === "processing" ? "..." : "Speak"}
+            </button>
+          )}
+          <button onClick={send} disabled={loading || !input.trim()}>Send</button>
+        </div>
+      <p className="voice-note" aria-live="polite">
+  {voice.status === "recording"
+    ? "Listening. Press Stop when you finish."
+    : voice.status === "processing"
+    ? "Converting your speech to text..."
+    : voice.message
+    ? voice.message
+    : voice.engine === "local"
+    ? "Voice: Local Whisper. Press Speak, say a sentence, then check the text before sending."
+    : voice.engine === "browser"
+    ? "Voice: browser speech recognition."
+    : "Voice input needs Chrome or Edge. If Speak is missing, use Chrome/Edge and reload the page."}
+</p>
+        </>
+      )}
+      {tab === "practice" && <Practice userId={userId} onAnswered={refreshProfile} />}
+      {tab === "review" && <Review userId={userId} />}
+    </main>
+  );
+}

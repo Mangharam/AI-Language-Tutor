@@ -1,0 +1,493 @@
+import os
+import tempfile
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from faster_whisper import WhisperModel
+from fastapi.middleware.cors import CORSMiddleware
+import sqlite3
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional
+
+app = FastAPI(title="AI Language Tutor")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB_PATH = "tutor.db"
+
+# Local Speech-to-Text
+whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def now():
+    return datetime.utcnow().isoformat()
+
+
+# ---------- Health ----------
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "stt": "browser"
+    }
+
+
+# ---------- Chat ----------
+
+@app.post("/api/chat")
+def chat(data: dict):
+    message = str(data.get("message", "")).strip()
+    user_id = data.get("user_id", "guest")
+
+    if not message:
+        return {
+            "reply": "Please write a sentence in English.",
+            "profile": get_profile_data(user_id),
+            "deltas": {"grammar": 0, "vocab": 0},
+            "highlights": [],
+            "cards_added": 0
+        }
+
+    corrected = message
+    changes = []
+    has_errors = False
+
+    rules = [
+        ("i am", "I am"),
+        ("i was", "I was"),
+        ("i have", "I have"),
+        ("i like", "I like"),
+    ]
+
+    lower = message.lower()
+
+    for wrong, right in rules:
+        if wrong in lower and message != message.replace(wrong, right):
+            corrected = corrected.replace(wrong, right)
+            changes.append({
+                "category": "grammar",
+                "type": "capitalization",
+                "from": wrong,
+                "to": right
+            })
+            has_errors = True
+
+    # Common simple grammar corrections
+    replacements = [
+        ("he go", "he goes"),
+        ("she go", "she goes"),
+        ("he play", "he plays"),
+        ("she play", "she plays"),
+        ("i goes", "I go"),
+        ("they goes", "they go"),
+        ("we goes", "we go"),
+    ]
+
+    for wrong, right in replacements:
+        if wrong in corrected.lower():
+            corrected = corrected.lower().replace(wrong, right)
+            changes.append({
+                "category": "grammar",
+                "type": "grammar",
+                "from": wrong,
+                "to": right
+            })
+            has_errors = True
+
+    if has_errors:
+        reply = f"Good attempt! A better version is: {corrected}"
+    else:
+        reply = "Good sentence! Tell me a little more about your day."
+
+    conn = get_db()
+
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO attempts
+            (user_id, ts, original, corrected, has_errors)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, now(), message, corrected, int(has_errors))
+        )
+
+        attempt_id = cur.lastrowid
+
+        for change in changes:
+            conn.execute(
+                """
+                INSERT INTO errors
+                (attempt_id, user_id, category, from_text, to_text)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    user_id,
+                    change["category"],
+                    change["from"],
+                    change["to"]
+                )
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "reply": reply,
+        "profile": get_profile_data(user_id),
+        "deltas": {
+            "grammar": -1 if has_errors else 1,
+            "vocab": 0
+        },
+        "correction": {
+            "has_errors": has_errors,
+            "corrected": corrected,
+            "changes": changes
+        },
+        "highlights": [],
+        "cards_added": 0
+    }
+
+
+# ---------- Profile ----------
+
+def get_profile_data(user_id):
+    conn = get_db()
+
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()[0]
+
+        errors = conn.execute(
+            "SELECT COUNT(*) FROM errors WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()[0]
+
+        accuracy = 100 if total == 0 else max(
+            0, round(((total - errors) / total) * 100)
+        )
+
+        return {
+            "total": total,
+            "accuracy": accuracy,
+            "recent_accuracy": accuracy,
+            "levels": {
+                "grammar": {
+                    "cefr": "A1",
+                    "score": accuracy
+                },
+                "vocab": {
+                    "cefr": "A1",
+                    "score": accuracy
+                },
+                "overall": {
+                    "cefr": "A1",
+                    "score": accuracy,
+                    "provisional": True
+                }
+            },
+            "weak_areas": []
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/profile/{user_id}")
+def profile(user_id: str):
+    return get_profile_data(user_id)
+
+
+@app.delete("/api/profile/{user_id}")
+def delete_profile(user_id: str):
+    conn = get_db()
+
+    try:
+        conn.execute("DELETE FROM errors WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM attempts WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM skills WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM level_history WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM exercise_results WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM cards WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM speech_words WHERE user_id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return get_profile_data(user_id)
+
+
+# ---------- Exercises ----------
+
+EXERCISES = [
+    {
+        "id": 1,
+        "category": "Grammar",
+        "level": "A1",
+        "question": "She ___ to school every day.",
+        "options": ["go", "goes", "going", "gone"],
+        "answer": 1,
+        "why": "With 'She', we use 'goes' in the simple present."
+    },
+    {
+        "id": 2,
+        "category": "Vocabulary",
+        "level": "A1",
+        "question": "What is the opposite of 'hot'?",
+        "options": ["warm", "cold", "big", "fast"],
+        "answer": 1,
+        "why": "'Cold' is the opposite of 'hot'."
+    },
+    {
+        "id": 3,
+        "category": "Grammar",
+        "level": "A2",
+        "question": "They ___ playing football yesterday.",
+        "options": ["was", "is", "were", "are"],
+        "answer": 2,
+        "why": "With 'They' in the past continuous, we use 'were'."
+    },
+    {
+        "id": 4,
+        "category": "Vocabulary",
+        "level": "A2",
+        "question": "Choose the word closest to 'happy'.",
+        "options": ["sad", "angry", "glad", "tired"],
+        "answer": 2,
+        "why": "'Glad' has a similar meaning to 'happy'."
+    }
+]
+
+
+@app.get("/api/exercise/{user_id}")
+def get_exercise(user_id: str):
+    exercise = EXERCISES[
+        sum(
+            1 for _ in []
+        ) % len(EXERCISES)
+    ]
+
+    return {
+        "id": exercise["id"],
+        "category": exercise["category"],
+        "level": exercise["level"],
+        "question": exercise["question"],
+        "options": exercise["options"]
+    }
+
+
+@app.post("/api/exercise/answer")
+def exercise_answer(data: dict):
+    user_id = data.get("user_id", "guest")
+    exercise_id = int(data.get("exercise_id", 1))
+    choice = int(data.get("choice", 0))
+
+    exercise = next(
+        (x for x in EXERCISES if x["id"] == exercise_id),
+        None
+    )
+
+    if exercise is None:
+        raise HTTPException(status_code=404, detail="Exercise not found")
+
+    correct = choice == exercise["answer"]
+
+    conn = get_db()
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO exercise_results
+            (user_id, ts, exercise_id, category, level, correct)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                now(),
+                exercise_id,
+                exercise["category"],
+                exercise["level"],
+                int(correct)
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "correct": correct,
+        "answer_index": exercise["answer"],
+        "why": exercise["why"]
+    }
+
+
+# ---------- Review ----------
+
+@app.get("/api/review/{user_id}")
+def review(user_id: str):
+    conn = get_db()
+
+    try:
+        card = conn.execute(
+            """
+            SELECT *
+            FROM cards
+            WHERE user_id = ?
+            AND due <= ?
+            ORDER BY due
+            LIMIT 1
+            """,
+            (user_id, now())
+        ).fetchone()
+
+        total = conn.execute(
+            "SELECT COUNT(*) FROM cards WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()[0]
+
+        due = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM cards
+            WHERE user_id = ? AND due <= ?
+            """,
+            (user_id, now())
+        ).fetchone()[0]
+
+        if card:
+            card_data = {
+                "id": card["id"],
+                "sentence": card["sentence"],
+                "hint": card["answer"]
+            }
+        else:
+            card_data = None
+
+        return {
+            "due_count": due,
+            "total_cards": total,
+            "card": card_data
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/review/answer")
+def review_answer(data: dict):
+    user_id = data.get("user_id", "guest")
+    card_id = int(data.get("card_id"))
+    answer = str(data.get("answer", "")).strip()
+
+    conn = get_db()
+
+    try:
+        card = conn.execute(
+            "SELECT * FROM cards WHERE id = ? AND user_id = ?",
+            (card_id, user_id)
+        ).fetchone()
+
+        if not card:
+            raise HTTPException(status_code=404, detail="Card not found")
+
+        correct = answer.lower() == card["answer"].lower()
+
+        days = 2 if correct else 1
+        due = (datetime.utcnow() + timedelta(days=days)).isoformat()
+
+        conn.execute(
+            """
+            UPDATE cards
+            SET due = ?, reps = reps + 1
+            WHERE id = ? AND user_id = ?
+            """,
+            (due, card_id, user_id)
+        )
+
+        conn.commit()
+
+        return {
+            "correct": correct,
+            "answer": card["answer"],
+            "next_review_days": days
+        }
+    finally:
+        conn.close()
+
+
+# ---------- Speech ----------
+
+@app.post("/api/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    temp_path = None
+
+    try:
+        audio_data = await file.read()
+
+        if not audio_data:
+            raise HTTPException(
+                status_code=400,
+                detail="No audio data received"
+            )
+
+        # Create a unique temporary audio file
+        suffix = ".webm"
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix
+        ) as temp_file:
+            temp_file.write(audio_data)
+            temp_path = temp_file.name
+
+        # Transcribe using local Whisper
+        segments, info = whisper_model.transcribe(
+            temp_path,
+            beam_size=5,
+            language="en",
+            vad_filter=True
+        )
+
+        transcript = " ".join(
+            segment.text.strip()
+            for segment in segments
+        ).strip()
+
+        return {
+            "transcript": transcript,
+            "words": transcript.split()
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("TRANSCRIBE ERROR:", repr(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Speech recognition error: {str(e)}"
+        )
+
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+@app.get("/")
+def root():
+    return {"message": "AI Language Tutor backend is running"}

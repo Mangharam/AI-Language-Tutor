@@ -1,0 +1,29 @@
+```gitignore
+.venv/
+.venv-kokoro/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+google-credentials.json
+node_modules/
+dist/
+*.db
+```
+
+# Python virtual environments
+backend/venv/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Node dependencies
+node_modules/
+
+# Temporary audio test files
+kokoro_test.wav
+kokoro_api_test.wav
