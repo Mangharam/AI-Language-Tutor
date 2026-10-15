@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API_BASE = "http://127.0.0.1:8010";
+const API_BASE = import.meta.env.DEV ? "http://127.0.0.1:8010" : "";
 
 const GREETING = {
   role: "tutor",
@@ -5487,7 +5487,7 @@ const voice = useVoice((text, words) => {
           role: "tutor",
 
           reply:
-            "I could not reach the server. Please make sure the backend is running on port 8010.",
+            "I could not reach the server. Please check your connection and try again.",
         },
       ]);
     } finally {
