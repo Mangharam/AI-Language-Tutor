@@ -74,9 +74,11 @@ def llm_chat(
     }
 
     if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    response = groq_client.chat.completions.create(**kwargs)
+        try:
+         response = groq_client.chat.completions.create(**kwargs)
+    except Exception as e:
+         print(f"[GROQ ERROR] {type(e).__name__}: {e}")
+    raise
 
     return (response.choices[0].message.content or "").strip()
 
