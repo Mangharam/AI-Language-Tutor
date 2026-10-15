@@ -8,12 +8,13 @@ from difflib import SequenceMatcher
 
 from concurrent.futures import ThreadPoolExecutor
 
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 
+from faster_whisper import WhisperModel
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
 
 import sqlite3
 import uuid
@@ -33,62 +34,16 @@ from openai import OpenAI
 
 load_dotenv()
 
-# ============================================================
-# GROQ (FREE HOSTED LLM + SPEECH-TO-TEXT)
-# ============================================================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
-STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
+if not OPENAI_API_KEY:
+    print("WARNING: OPENAI_API_KEY is not configured.")
 
-if not GROQ_API_KEY:
-    print("WARNING: GROQ_API_KEY is not configured.")
-
-groq_client = (
-    OpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
-        max_retries=1,
-    )
-    if GROQ_API_KEY
+openai_client = (
+    OpenAI(api_key=OPENAI_API_KEY)
+    if OPENAI_API_KEY
     else None
 )
-
-
-def llm_chat(
-    messages,
-    max_tokens=200,
-    temperature=0.3,
-    json_mode=False,
-    timeout=30,
-):
-    if groq_client is None:
-        raise RuntimeError("GROQ_API_KEY is not configured")
-
-    kwargs = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "timeout": timeout,
-    }
-
-    if json_mode:
-        try:
-         response = groq_client.chat.completions.create(**kwargs)
-    except Exception as e:
-         print(f"[GROQ ERROR] {type(e).__name__}: {e}")
-    raise
-
-    return (response.choices[0].message.content or "").strip()
-
-
-def llm_complete(prompt, **kwargs):
-    return llm_chat(
-        [{"role": "user", "content": prompt}],
-        **kwargs
-    )
-
 
 
 # ============================================================
@@ -101,19 +56,21 @@ app = FastAPI(
 
 memory_executor = ThreadPoolExecutor(max_workers=1)
 
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        "ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX") or None,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -127,10 +84,9 @@ BASE_DIR = os.path.dirname(
     os.path.abspath(__file__)
 )
 
-DB_PATH = os.getenv("DB_PATH") or (
-    "/tmp/tutor.db"
-    if os.getenv("VERCEL")
-    else os.path.join(BASE_DIR, "tutor.db")
+DB_PATH = os.path.join(
+    BASE_DIR,
+    "tutor.db"
 )
 
 
@@ -139,8 +95,38 @@ DB_PATH = os.getenv("DB_PATH") or (
 # AI MODELS
 # ============================================================
 
-# Speech-to-text and grammar/chat now run on Groq (see llm_chat and
-# the /api/transcribe endpoint), so no local models are loaded here.
+print("Loading Whisper base model...")
+
+whisper_model = WhisperModel(
+    "base",
+    device="cpu",
+    compute_type="int8",
+    cpu_threads=4,
+    num_workers=1
+)
+
+print("Whisper base model loaded successfully.")
+
+
+# ------------------------------------------------------------
+# Grammar Model
+# ------------------------------------------------------------
+
+GRAMMAR_MODEL_NAME = (
+    "vennify/t5-base-grammar-correction"
+)
+
+print("Loading AI grammar model...")
+
+grammar_tokenizer = AutoTokenizer.from_pretrained(
+    GRAMMAR_MODEL_NAME
+)
+
+grammar_model = AutoModelForSeq2SeqLM.from_pretrained(
+    GRAMMAR_MODEL_NAME
+)
+
+print("AI grammar model loaded successfully.")
 
 
 from pydantic import BaseModel, Field
@@ -1604,24 +1590,26 @@ def correct_grammar_with_ai(sentence):
 
     try:
         t0 = time.perf_counter()
-        corrected = llm_complete(
-            "Fix only the grammar, spelling and punctuation mistakes in "
-            "the sentence below. Keep the original wording, meaning and "
-            "tense as much as possible. Do not add or remove information. "
-            "If the sentence is already correct, return it unchanged. "
-            "Return ONLY the sentence, with no quotes and no explanation.\n\n"
-            f"Sentence: {sentence}",
-            max_tokens=120,
-            temperature=0,
-            timeout=20,
+        inputs = grammar_tokenizer(
+            "grammar: " + sentence,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256
         )
 
-        corrected = re.sub(
-            r"^(corrected|sentence)\s*:\s*",
-            "",
-            corrected,
-            flags=re.IGNORECASE
-        ).strip().strip('"').strip()
+        
+        outputs = grammar_model.generate(
+        **inputs,
+        max_new_tokens=64,
+        num_beams=1,
+        do_sample=False
+)
+
+
+        corrected = grammar_tokenizer.decode(
+            outputs[0],
+            skip_special_tokens=True
+        ).strip()
 
         if not corrected:
 
@@ -1869,17 +1857,40 @@ Return JSON:
 """
         
        
+        payload = json.dumps({
+            "model": "qwen2.5:1.5b",
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "10m",
+            "options": {
+                "num_predict": 20,
+                "num_ctx": 1024,
+                "temperature": 0,
+                "num_thread": 2
+            }
+        }).encode("utf-8")
+
+
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+
+
         ollama_start = time.perf_counter()
 
-        result = {
-            "response": llm_complete(
-                prompt,
-                max_tokens=200,
-                temperature=0,
-                json_mode=True,
-                timeout=30,
+        with urllib.request.urlopen(
+            request,
+            timeout=60
+        ) as response:
+
+            result = json.loads(
+                response.read().decode("utf-8")
             )
-        }
 
         ollama_elapsed = time.perf_counter() - ollama_start
 
@@ -2633,16 +2644,35 @@ Rules:
 
 Tutor:"""
 
+        payload = json.dumps({
+            "model": "qwen2.5:1.5b",
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "10m",
+            "options": {
+                "temperature": 0.5,
+                "num_predict": 100
+            }
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+
         qwen_start = time.perf_counter()
 
-        result = {
-            "response": llm_complete(
-                prompt,
-                max_tokens=100,
-                temperature=0.5,
-                timeout=30,
+        with urllib.request.urlopen(
+            request,
+            timeout=60
+        ) as response:
+            result = json.loads(
+                response.read().decode("utf-8")
             )
-        }
 
         print(
             "[FRIENDLY CHAT TIME]",
@@ -2723,15 +2753,31 @@ Examples:
 JSON:
 """
 
-        result = {
-            "response": llm_complete(
-                prompt,
-                max_tokens=300,
-                temperature=0,
-                json_mode=True,
-                timeout=30,
+        payload = json.dumps(
+            {
+                "model": "qwen2.5:1.5b",
+                "prompt": prompt,
+                "stream": False
+            }
+        ).encode("utf-8")
+
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=60
+        ) as response:
+
+            result = json.loads(
+                response.read().decode("utf-8")
             )
-        }
 
         raw = result.get(
             "response",
@@ -3032,22 +3078,43 @@ def _trim_to_sentence(reply):
 
 
 def _ollama_chat(messages, num_predict, temperature, timeout=60):
-    # Name kept so callers do not change; it now calls Groq.
+    payload = json.dumps({
+        "model": "qwen2.5:1.5b",
+        "messages": messages,
+        "stream": False,
+        "keep_alive": "30m",
+        "options": {
+            "num_predict": num_predict,
+            "num_ctx": 1024,
+            "temperature": temperature,
+            "num_thread": 4
+        }
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        "http://localhost:11434/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
     started = time.perf_counter()
 
-    reply = llm_chat(
-        messages,
-        max_tokens=max(int(num_predict), 80),
-        temperature=temperature,
-        timeout=timeout,
-    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = json.loads(response.read().decode("utf-8"))
 
     print(
-        f"[SPEED TEST] LLM chat total: "
+        f"[SPEED TEST] Ollama HTTP total: "
         f"{time.perf_counter() - started:.2f}s"
     )
+    print("[OLLAMA METRICS]", {
+        "total_seconds": round(result.get("total_duration", 0) / 1e9, 2),
+        "load_seconds": round(result.get("load_duration", 0) / 1e9, 2),
+        "prompt_tokens": result.get("prompt_eval_count"),
+        "generated_tokens": result.get("eval_count"),
+    })
 
-    return reply
+    return str(result.get("message", {}).get("content", "")).strip()
 
 
 def describe_word_changes(original, corrected):
@@ -3725,15 +3792,29 @@ The original and corrected phrases must come from the student's transcript
 and its corrected version. Do not invent mistakes.
 """
 
-        model_result = {
-            "response": llm_complete(
-                prompt,
-                max_tokens=900,
-                temperature=0.2,
-                json_mode=True,
-                timeout=45,
+        payload = {
+    "model": "qwen2.5:1.5b",
+    "prompt": prompt,
+    "stream": False,
+    "keep_alive": "30m",
+    "options": {
+        "num_thread": 4,
+        "num_predict": 60,
+    },}.encode("utf-8")
+
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(
+            request, timeout=90
+        ) as response:
+            model_result = json.loads(
+                response.read().decode("utf-8")
             )
-        }
 
         raw_result = model_result.get("response", "").strip()
 
@@ -3840,7 +3921,7 @@ and its corrected version. Do not invent mistakes.
                         "category": "grammar"
                     })
         else:
-            # Fallback to corrections returned by the AI model.
+            # Fallback to corrections returned by Ollama.
             ai_corrections = ai_data.get("corrections", [])
 
             if isinstance(ai_corrections, list):
@@ -3913,7 +3994,12 @@ and its corrected version. Do not invent mistakes.
         import sqlite3
         from datetime import datetime
 
-        conn = sqlite3.connect(DB_PATH)
+        db_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "tutor.db"
+        )
+
+        conn = sqlite3.connect(db_path)
 
         try:
             cursor = conn.cursor()
@@ -3974,7 +4060,7 @@ and its corrected version. Do not invent mistakes.
             status_code=500,
             detail=(
                 "Unable to generate speaking feedback. "
-                "Please try again in a moment."
+                "Check that Ollama is running and qwen2.5:1.5b is available."
             )
         )
 
@@ -5356,36 +5442,17 @@ async def transcribe(
 
         whisper_start = time.perf_counter()
 
-        if groq_client is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Speech recognition is not configured (GROQ_API_KEY missing)"
-            )
+        segments, info = whisper_model.transcribe(
+            temp_path,
+            beam_size=1,
+            language="en",
+            vad_filter=True
+        )
 
-        content_type = (file.content_type or "").lower()
-
-        if "mp4" in content_type or "m4a" in content_type:
-            ext = "mp4"
-        elif "ogg" in content_type:
-            ext = "ogg"
-        elif "wav" in content_type:
-            ext = "wav"
-        else:
-            ext = "webm"
-
-        def _run_stt():
-            return groq_client.audio.transcriptions.create(
-                file=(f"audio.{ext}", audio_data, f"audio/{ext}"),
-                model=STT_MODEL,
-                language="en",
-                response_format="json",
-                temperature=0,
-                timeout=60,
-            )
-
-        stt_result = await run_in_threadpool(_run_stt)
-
-        transcript = (stt_result.text or "").strip()
+        transcript = " ".join(
+            segment.text.strip()
+            for segment in segments
+        ).strip()
 
         print(
             f"[SPEED TEST] Whisper transcription: "
@@ -5430,9 +5497,7 @@ async def transcribe(
 def health():
     return {
         "status": "ok",
-        "stt": "groq-whisper",
-        "llm": LLM_MODEL,
-        "llm_configured": groq_client is not None
+        "stt": "whisper"
     }
 
 # ============================================================
@@ -5446,6 +5511,148 @@ def root():
         "message":
         "AI Language Tutor backend is running"
     }
+
+
+# ============================================================
+# OPENAI TEST
+# ============================================================
+
+@app.get("/api/ai-test")
+def ai_test():
+
+    if not openai_client:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "OPENAI_API_KEY is not configured"
+            )
+        )
+
+    try:
+
+        response = (
+            openai_client.responses.create(
+                model="gpt-5-mini",
+                input=(
+                    "You are an English tutor. "
+                    "Say hello to the student "
+                    "in one short sentence."
+                )
+            )
+        )
+
+        return {
+
+            "success": True,
+
+            "reply": response.output_text
+        }
+
+    except Exception as e:
+
+        print(
+            "OPENAI ERROR:",
+            repr(e)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+# ============================================================
+# A2 -> C2 COURSE LESSONS
+# ============================================================
+
+COURSE_LEVELS = {
+    "A1": [
+        "Pronouns",
+        "am / is / are",
+        "Articles: a / an / the",
+        "Singular and Plural",
+        "Subject-Verb Agreement",
+        "Present Simple",
+        "Present Continuous",
+        "Basic Questions",
+        "Daily Life Vocabulary",
+        "University Vocabulary",
+    ],
+
+    "A2": [
+        "Past Simple",
+        "Past Continuous",
+        "Future: will and going to",
+        "Present Perfect",
+        "Comparatives and Superlatives",
+        "Modal Verbs",
+        "Countable and Uncountable Nouns",
+        "Quantifiers",
+        "Prepositions in Context",
+        "Adverbs of Frequency",
+        "Everyday Conversations",
+        "Paragraph Writing",
+    ],
+
+    "B1": [
+        "Present Perfect vs Past Simple",
+        "Past Perfect",
+        "Future Forms",
+        "First Conditional",
+        "Second Conditional",
+        "Relative Clauses",
+        "Gerunds and Infinitives",
+        "Reported Speech",
+        "Passive Voice",
+        "Phrasal Verbs",
+        "Academic Vocabulary",
+        "Opinion Writing",
+    ],
+
+    "B2": [
+        "Advanced Tenses",
+        "Mixed Conditionals",
+        "Advanced Passive Voice",
+        "Causative Structures",
+        "Advanced Reported Speech",
+        "Modal Verbs of Deduction",
+        "Complex Relative Clauses",
+        "Inversion",
+        "Advanced Phrasal Verbs",
+        "Collocations",
+        "Formal English",
+        "Essay Writing",
+    ],
+
+    "C1": [
+        "Advanced Sentence Structures",
+        "Emphasis and Cleft Sentences",
+        "Advanced Conditionals",
+        "Subjunctive Mood",
+        "Nuanced Modal Verbs",
+        "Advanced Linking Devices",
+        "Academic Grammar",
+        "Advanced Vocabulary",
+        "Idioms and Expressions",
+        "Professional Communication",
+        "Critical Reading",
+        "Advanced Essay Writing",
+    ],
+
+    "C2": [
+        "Mastering Complex Grammar",
+        "Advanced Inversion",
+        "Ellipsis and Substitution",
+        "Discourse Analysis",
+        "Advanced Collocations",
+        "Idiomatic Language",
+        "Register and Tone",
+        "Academic Writing Mastery",
+        "Professional Writing Mastery",
+        "Critical Analysis",
+        "Advanced Speaking",
+        "English Proficiency Mastery",
+    ],
+}
 
 
 # ============================================================
@@ -6820,69 +7027,6 @@ def initialize_advanced_course():
     finally:
 
         conn.close()
-
-
-# ============================================================
-# TABLES USED BY THE API BUT NOT CREATED ELSEWHERE
-# (CREATE IF NOT EXISTS: safe on an existing local tutor.db)
-# ============================================================
-
-def init_legacy_tables():
-    conn = get_db()
-    try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                ts TEXT,
-                original TEXT,
-                corrected TEXT,
-                has_errors INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS errors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                attempt_id INTEGER,
-                user_id TEXT NOT NULL,
-                category TEXT,
-                from_text TEXT,
-                to_text TEXT
-            );
-            CREATE TABLE IF NOT EXISTS cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                sentence TEXT,
-                answer TEXT,
-                due TEXT,
-                reps INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS exercise_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                ts TEXT,
-                exercise_id,
-                category TEXT,
-                level,
-                correct INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS level_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS skills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS speech_words (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL
-            );
-        """)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-init_legacy_tables()
 
 
 # ============================================================
