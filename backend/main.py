@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File
 
 from faster_whisper import WhisperModel
 
@@ -65,17 +65,6 @@ app.add_middleware(
 )
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # ============================================================
 # PATHS
 # ============================================================
@@ -90,22 +79,19 @@ DB_PATH = os.path.join(
 )
 
 
-
 # ============================================================
 # AI MODELS
 # ============================================================
 
-print("Loading Whisper base model...")
+print("Loading Whisper model...")
 
 whisper_model = WhisperModel(
-    "base",
+    "small",
     device="cpu",
-    compute_type="int8",
-    cpu_threads=4,
-    num_workers=1
+    compute_type="int8"
 )
 
-print("Whisper base model loaded successfully.")
+print("Whisper model loaded successfully.")
 
 
 # ------------------------------------------------------------
@@ -129,41 +115,6 @@ grammar_model = AutoModelForSeq2SeqLM.from_pretrained(
 print("AI grammar model loaded successfully.")
 
 
-from pydantic import BaseModel, Field
-from pwdlib import PasswordHash
-
-password_hasher = PasswordHash.recommended()
-
-
-class SignupRequest(BaseModel):
-    email: str = Field(min_length=5, max_length=254)
-    password: str = Field(min_length=8, max_length=128)
-    display_name: str = Field(min_length=1, max_length=80)
-
-
-class LoginRequest(BaseModel):
-    email: str = Field(min_length=5, max_length=254)
-    password: str = Field(min_length=1, max_length=128)
-
-
-def init_auth_db():
-    conn = get_db()
-    try:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                display_name TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-
 # ============================================================
 # DATABASE
 # ============================================================
@@ -178,204 +129,6 @@ def get_db():
 
     return conn
 
-from fastapi import HTTPException
-import secrets
-import hashlib
-
-
-def create_auth_session(conn, user_id: str):
-    token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-
-    expires_at = (datetime.utcnow() + timedelta(days=7)).isoformat()
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS auth_sessions (
-            token_hash TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
-    )
-
-    conn.execute(
-        """
-        INSERT INTO auth_sessions (token_hash, user_id, expires_at)
-        VALUES (?, ?, ?)
-        """,
-        (token_hash, user_id, expires_at),
-    )
-
-    return token
-    
-def get_authenticated_user_id(authorization: str | None):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required",
-        )
-
-    token = authorization.removeprefix("Bearer ").strip()
-
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication token",
-        )
-
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-
-    conn = get_db()
-
-    try:
-        session = conn.execute(
-            """
-            SELECT user_id, expires_at
-            FROM auth_sessions
-            WHERE token_hash = ?
-            """,
-            (token_hash,),
-        ).fetchone()
-
-        if not session:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid authentication token",
-            )
-
-        expiry = datetime.fromisoformat(session["expires_at"])
-
-        if datetime.utcnow() >= expiry:
-            conn.execute(
-                "DELETE FROM auth_sessions WHERE token_hash = ?",
-                (token_hash,),
-            )
-            conn.commit()
-
-            raise HTTPException(
-                status_code=401,
-                detail="Session expired. Please log in again.",
-            )
-
-        return session["user_id"]
-
-    finally:
-        conn.close()
-
-
-@app.post("/api/auth/signup")
-def signup(data: SignupRequest):
-    email = data.email.strip().lower()
-    display_name = data.display_name.strip()
-
-    if not display_name:
-        raise HTTPException(status_code=400, detail="Name is required")
-
-    conn = get_db()
-
-    try:
-        existing = conn.execute(
-            "SELECT id FROM users WHERE email = ?",
-            (email,),
-        ).fetchone()
-
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail="An account with this email already exists",
-            )
-
-        user_id = str(uuid.uuid4())
-        password_hash = password_hasher.hash(data.password)
-
-        conn.execute(
-            """
-            INSERT INTO users (id, email, display_name, password_hash, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user_id, email, display_name, password_hash, now()),
-        )
-
-        token = create_auth_session(conn, user_id)
-        conn.commit()
-
-        return {
-            "message": "Account created successfully",
-            "user": {
-                "id": user_id,
-                "email": email,
-                "display_name": display_name,
-            },
-            "access_token": token,
-            "token_type": "bearer",
-        }
-
-    finally:
-        conn.close()
-
-
-@app.post("/api/auth/login")
-def login(data: LoginRequest):
-    email = data.email.strip().lower()
-
-    conn = get_db()
-
-    try:
-        user = conn.execute(
-            """
-            SELECT id, email, display_name, password_hash
-            FROM users
-            WHERE email = ?
-            """,
-            (email,),
-        ).fetchone()
-
-        if not user or not password_hasher.verify(
-            data.password, user["password_hash"]
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid email or password",
-            )
-
-        token = create_auth_session(conn, user["id"])
-        conn.commit()
-
-        return {
-            "message": "Login successful",
-            "user": {
-                "id": user["id"],
-                "email": user["email"],
-                "display_name": user["display_name"],
-            },
-            "access_token": token,
-            "token_type": "bearer",
-        }
-
-    finally:
-        conn.close()
-
-@app.post("/api/auth/logout")
-def logout(authorization: str | None = Header(default=None)):
-    # Token ko verify karo
-    user_id = get_authenticated_user_id(authorization)
-
-    token = authorization.removeprefix("Bearer ").strip()
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-
-    conn = get_db()
-    try:
-        conn.execute(
-            "DELETE FROM auth_sessions WHERE token_hash = ? AND user_id = ?",
-            (token_hash, user_id),
-        )
-        conn.commit()
-        return {"message": "Logged out successfully"}
-    finally:
-        conn.close()
-
-
 
 def now():
 
@@ -383,7 +136,6 @@ def now():
 
 
 def init_conversation_db():
-    init_auth_db()
 
     conn = get_db()
 
@@ -1865,8 +1617,7 @@ Return JSON:
             "options": {
                 "num_predict": 20,
                 "num_ctx": 1024,
-                "temperature": 0,
-                "num_thread": 2
+                "temperature": 0
             }
         }).encode("utf-8")
 
@@ -1881,8 +1632,6 @@ Return JSON:
         )
 
 
-        ollama_start = time.perf_counter()
-
         with urllib.request.urlopen(
             request,
             timeout=60
@@ -1892,44 +1641,14 @@ Return JSON:
                 response.read().decode("utf-8")
             )
 
-        ollama_elapsed = time.perf_counter() - ollama_start
-
-        print(
-            f"[SPEED TEST] Ollama HTTP + response parsing: "
-            f"{ollama_elapsed:.2f}s"
-        )
-
-        print(
-            "[SPEED TEST] Prompt tokens:",
-            result.get("prompt_eval_count", "N/A")
-        )
-
-        print(
-            "[SPEED TEST] Generated tokens:",
-            result.get("eval_count", "N/A")
-        )
-
-        print(
-            "[SPEED TEST] Token generation time:",
-            round(result.get("eval_duration", 0) / 1_000_000_000, 2),
-            "s"
-        )
 
         raw = result.get(
             "response",
             ""
         ).strip()
 
-        print("[DEBUG] Natural Qwen response received")
-        print("[DEBUG] OLLAMA TIMING:", result.get("total_duration"), result.get("eval_count"), result.get("eval_duration"))
-        print("[DEBUG] Ollama response keys:", list(result.keys()))
-        print("[DEBUG] Prompt tokens:", result.get("prompt_eval_count"))
-        print("[DEBUG] Generated tokens:", result.get("eval_count"))
-        print(
-            "[DEBUG] Generation seconds:",
-            round(result.get("eval_duration", 0) / 1_000_000_000, 2)
-        )
 
+        print("[DEBUG] Natural Qwen response received")
 
 
         # --------------------------------------------------------
@@ -2149,92 +1868,46 @@ Return JSON:
         }
 
 
-
 # ============================================================
 # ERROR CATEGORY CLASSIFICATION
 # ============================================================
 
-def classify_error_category(original, corrected):
-    if normalize_grammar_text(original) == normalize_grammar_text(corrected):
+def classify_error_category(
+    original,
+    corrected
+):
+    if (
+        normalize_grammar_text(original)
+        ==
+        normalize_grammar_text(corrected)
+    ):
         return None
 
-    original_words = re.findall(r"[A-Za-z']+", original)
-    corrected_words = re.findall(r"[A-Za-z']+", corrected)
+    original_words = re.findall(
+        r"[A-Za-z']+",
+        original
+    )
 
-    original_lower = [word.lower() for word in original_words]
-    corrected_lower = [word.lower() for word in corrected_words]
+    corrected_words = re.findall(
+        r"[A-Za-z']+",
+        corrected
+    )
 
-    matcher = SequenceMatcher(None, original_lower, corrected_lower)
+    original_lower = [
+        word.lower()
+        for word in original_words
+    ]
 
-    # 1. Check common verb-form and tense changes first.
-    verb_pairs = {
-        ("go", "went"), ("go", "goes"),
-        ("visit", "visited"), ("study", "studied"),
-        ("take", "took"), ("meet", "met"),
-        ("return", "returned"), ("complete", "completed"),
-        ("attend", "attended"), ("explain", "explained"),
-        ("discuss", "discussed"), ("come", "came"),
-        ("eat", "ate"), ("see", "saw"),
-        ("write", "wrote"), ("speak", "spoke"),
-        ("do", "did"), ("have", "had"),
-        ("is", "was"), ("are", "were"),
-        ("walk", "walked"), ("play", "played"),
-        ("work", "worked"), ("learn", "learned"),
-        ("read", "read"), ("goes", "go"),
-        ("went", "go"), ("studies", "study"),
-        ("has", "have"), ("does", "do")
-    }
+    corrected_lower = [
+        word.lower()
+        for word in corrected_words
+    ]
 
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag in ("replace", "insert", "delete"):
-            old_words = original_lower[i1:i2]
-            new_words = corrected_lower[j1:j2]
-
-            for old in old_words:
-                for new in new_words:
-                    if (old, new) in verb_pairs:
-                        return "grammar"
-
-    # 2. Punctuation-only changes.
-    original_clean = re.sub(r"[^\w\s]", "", original.lower())
-    corrected_clean = re.sub(r"[^\w\s]", "", corrected.lower())
-
-    if original_clean == corrected_clean:
-        return "punctuation"
-
-    # 3. Spelling changes: only very similar word replacements.
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "replace":
-            old_words = original_words[i1:i2]
-            new_words = corrected_words[j1:j2]
-
-            if len(old_words) == len(new_words):
-                for old, new in zip(old_words, new_words):
-                    similarity = SequenceMatcher(
-                        None, old.lower(), new.lower()
-                    ).ratio()
-
-                    if old.lower() != new.lower() and similarity >= 0.85:
-                        return "spelling"
-
-    # 4. Word choice for substantially different words.
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "replace":
-            old_words = original_words[i1:i2]
-            new_words = corrected_words[j1:j2]
-
-            if old_words and new_words:
-                scores = [
-                    SequenceMatcher(None, old.lower(), new.lower()).ratio()
-                    for old in old_words
-                    for new in new_words
-                ]
-
-                if scores and max(scores) < 0.50:
-                    return "word_choice"
-
-    return "grammar"
-
+    matcher = SequenceMatcher(
+        None,
+        original_lower,
+        corrected_lower
+    )
 
     # ============================================================
     # 1. SPELLING
@@ -2507,20 +2180,14 @@ def classify_error_category(original, corrected):
 
 
 def get_grammar_explanation(message, corrected):
-    original_words = re.findall(
-        r"[A-Za-z']+",
-        message.lower()
-    )
-    fixed_words = re.findall(
-        r"[A-Za-z']+",
-        corrected.lower()
-    )
+    original = message.strip().rstrip(".!?")
+    fixed = corrected.strip().rstrip(".!?")
 
-    original_set = set(original_words)
-    fixed_set = set(fixed_words)
+    original_words = original.lower().split()
+    fixed_words = fixed.lower().split()
 
-    # Common irregular past-tense corrections
-    past_tense_pairs = [
+    # Common past-tense corrections
+    past_tense_pairs = {
         ("go", "went"),
         ("come", "came"),
         ("eat", "ate"),
@@ -2534,66 +2201,21 @@ def get_grammar_explanation(message, corrected):
         ("buy", "bought"),
         ("make", "made"),
         ("speak", "spoke"),
-        ("meet", "met"),
-        ("read", "read"),
-    ]
+    }
 
     for old, new in past_tense_pairs:
-        if old in original_set and new in fixed_set:
+        if old in original_words and new in fixed_words:
             return (
-                f"Because this happened in the past, "
+                f"Because you are talking about the past, "
                 f"use '{new}' instead of '{old}'."
             )
 
-    # Common regular past-tense changes
-    regular_past_pairs = [
-        ("visit", "visited"),
-        ("study", "studied"),
-        ("attend", "attended"),
-        ("explain", "explained"),
-        ("discuss", "discussed"),
-        ("return", "returned"),
-        ("complete", "completed"),
-        ("walk", "walked"),
-        ("play", "played"),
-        ("work", "worked"),
-        ("learn", "learned"),
-        ("watch", "watched"),
-        ("talk", "talked"),
-        ("prepare", "prepared"),
-    ]
+    # Safe fallback: do not invent an explanation
+    return "The corrected sentence fixes a grammar mistake."
 
-    for old, new in regular_past_pairs:
-        if old in original_set and new in fixed_set:
-            return (
-                f"Because this happened in the past, "
-                f"use '{new}' instead of '{old}'."
-            )
-
-    # Subject-verb agreement
-    agreement_pairs = [
-        ("go", "goes"),
-        ("do", "does"),
-        ("have", "has"),
-        ("study", "studies"),
-        ("watch", "watches"),
-        ("try", "tries"),
-    ]
-
-    for old, new in agreement_pairs:
-        if old in original_set and new in fixed_set:
-            return (
-                f"With a singular subject like 'he' or 'she', "
-                f"the verb usually changes from '{old}' to '{new}'."
-            )
-
-    return (
-        "Check the verb form and sentence structure to see "
-        "how the corrected sentence improves the grammar."
-    )
 
 # ============================================================
-# LOCAL AI TUTOR RESPONSE - FRIENDLY CHAT
+# LOCAL AI TUTOR RESPONSE - OPTIMIZED
 # ============================================================
 
 def generate_local_tutor_response(
@@ -2602,7 +2224,12 @@ def generate_local_tutor_response(
     history=None
 ):
     try:
-        # Keep recent conversation for context
+        has_error = (
+            normalize_grammar_text(message)
+            != normalize_grammar_text(corrected)
+        )
+
+        # Keep only the latest few conversation messages
         history_lines = []
 
         if history:
@@ -2618,31 +2245,44 @@ def generate_local_tutor_response(
 
         history_text = "\n".join(history_lines)
 
-        # Friendly conversation only.
-        # Do not display grammar corrections automatically.
-        prompt = f"""You are a friendly English conversation tutor.
-Talk naturally like a supportive friend.
-Use simple English and reply in 1-3 short sentences.
+        if has_error:
+            grammar_instruction = f"""
+        Start with "Good attempt!"
+        Then write exactly:
+        Corrected: {corrected}
+        Briefly explain the main mistake in one simple sentence.
+        Do not say the original sentence is correct.
+        """
+        else:
+            grammar_instruction = """
+        Confirm the sentence is correct with a short positive response.
+        Ask one relevant follow-up question.
+        """
 
-Student's latest message:
-{message}
+        
+        
+        prompt = f"""You are a friendly English tutor. Use simple English and reply in 1-3 short sentences.
+
+Student message: {message}
+Corrected sentence: {corrected}
+Has grammar errors: {has_error}
+
+Rules:
+- Explain only the error in the student's original sentence.
+- Never discuss words that do not appear in the original sentence.
+- Make sure the explanation matches the corrected sentence.
+- Answer the student's actual question first.
+- If there are errors, start with "Good attempt!" and write exactly: Corrected: {corrected}
+- Briefly explain the main mistake in simple words.
+- If there are no errors, encourage the student and ask one relevant follow-up question.
+- Use recent conversation for context.
+- Never invent personal information.
 
 Recent conversation:
 {history_text}
 
-Rules:
-- Reply naturally to what the student said.
-- Be friendly, encouraging, and conversational.
-- Ask a relevant follow-up question when appropriate.
-- If the student says they went to university and met a teacher,
-  respond warmly and ask how the meeting went.
-- Do NOT correct grammar automatically.
-- Do NOT show a corrected sentence unless the student explicitly
-  asks you to check, correct, or explain their English.
-- Do not start with "Corrected:" or "Good attempt!" in normal chat.
-- Never invent personal information.
-
 Tutor:"""
+
 
         payload = json.dumps({
             "model": "qwen2.5:1.5b",
@@ -2650,8 +2290,8 @@ Tutor:"""
             "stream": False,
             "keep_alive": "10m",
             "options": {
-                "temperature": 0.5,
-                "num_predict": 100
+                "num_predict": 20,
+                "temperature": 0.2
             }
         }).encode("utf-8")
 
@@ -2664,33 +2304,76 @@ Tutor:"""
             method="POST"
         )
 
+        
         qwen_start = time.perf_counter()
 
         with urllib.request.urlopen(
             request,
             timeout=60
         ) as response:
+
             result = json.loads(
                 response.read().decode("utf-8")
             )
 
         print(
-            "[FRIENDLY CHAT TIME]",
+            "[NATURAL QWEN API TIME]",
             round(time.perf_counter() - qwen_start, 2),
             "seconds"
         )
+        
+        if has_error:
+            explanation = get_grammar_explanation(
+                message,
+                corrected
+            )
+
+            return (
+                f"Good attempt!\n"
+                f"Corrected: {corrected}\n"
+                f"{explanation}"
+            )
+
 
         reply = result.get("response", "").strip()
+        print(
+        "[QWEN STATS]",
+        "prompt_eval_count =", result.get("prompt_eval_count"),
+        "| eval_count =", result.get("eval_count"),
+        "| load_duration =", round(
+        result.get("load_duration", 0) / 1_000_000_000, 2
+    ),
+    "sec"
+)
 
         if reply:
             return reply
 
-        return "That's interesting, bro! Tell me more."
+        if has_error:
+            return f"Good attempt!\nCorrected: {corrected}"
 
+        return "That's correct! Keep practicing."
+
+   
     except Exception as e:
-        print("[LOCAL TUTOR RESPONSE ERROR]", repr(e))
-        return "That's interesting, bro! Tell me more."
+        print("OLLAMA ERROR:", repr(e))
 
+        if hasattr(e, "read"):
+            try:
+                print(
+                    "OLLAMA ERROR DETAILS:",
+                    e.read().decode("utf-8")
+                )
+            except Exception:
+                pass
+
+        if (
+            normalize_grammar_text(message)
+            != normalize_grammar_text(corrected)
+        ):
+            return f"Good attempt!\nCorrected: {corrected}"
+
+        return "That's correct! Keep practicing."
 
 
 # ============================================================
@@ -2896,370 +2579,158 @@ def fallback_message_intent(message):
     return "learn"
 
 
-
-
-# ============================================================
-# FLEXIBLE GRAMMAR INTENT DETECTION
-# ============================================================
-
-def normalize_intent_text(message):
-    text = str(message or "").lower().strip()
-    text = text.replace("’", "'")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip(" \t\r\n.!?")
-
-
-
-
-import difflib
-
-# ------------------------------------------------------------
-# Typo-tolerant detection of explicit correction requests
-# ------------------------------------------------------------
-
-_TYPO_TARGETS = ("english", "grammar", "sentence", "sentences")
-
-
-def _fix_typo(word):
-    """englsih -> english, grammer -> grammar (only for long words)."""
-    if len(word) >= 5 and word not in _TYPO_TARGETS:
-        match = difflib.get_close_matches(
-            word, _TYPO_TARGETS, n=1, cutoff=0.8
-        )
-        if match:
-            return match[0]
-    return word
-
-
-_CMD_PREFIX = (
-    r"(?:(?:hey|hi|hello|ok|okay|so|now)\s+)?"
-    r"(?:(?:can|could|would|will)\s+you\s+)?"
-    r"(?:please\s+)?"
-)
-_CMD_VERB = r"(?:check|correct|fix|review|improve|polish|proofread)"
-_CMD_OBJECT = (
-    r"(?:(?:my|the|this|that|our|previous|last)\s+)*"
-    r"(?:english|grammar|sentences?|writing|mistakes|errors)"
-    r"(?:\s+(?:mistakes|errors))?"
-)
-_CMD_SUFFIX = (
-    r"(?:\s+(?:for\s+me|please|again|now|thanks|thank\s+you))*"
-)
-_IS_CORRECT = (
-    r"(?:is|are)\s+(?:my|this|that|the)\s+"
-    r"(?:sentences?|english|grammar|writing)\s+"
-    r"(?:correct|right|ok|okay|good)"
-)
-
-# The whole message is only a command ("Can you check my English?")
-_COMMAND_ONLY_PATTERNS = [
-    re.compile(f"{_CMD_PREFIX}{_CMD_VERB}\\s+{_CMD_OBJECT}{_CMD_SUFFIX}"),
-    re.compile(f"{_CMD_PREFIX}{_CMD_VERB}\\s+(?:this|that|it){_CMD_SUFFIX}"),
-    re.compile(
-        f"{_CMD_PREFIX}(?:tell|show|find|identify)\\s+(?:me\\s+)?"
-        f"(?:my|the|any)\\s+(?:grammar\\s+)?(?:mistakes|errors|issues)"
-        f"{_CMD_SUFFIX}"
-    ),
-    re.compile(_IS_CORRECT + _CMD_SUFFIX),
-    re.compile(r"(?:please\s+)?grammar\s+(?:check|correction|review)"),
-]
-
-# A command at the START of the message, followed by the sentence
-_INLINE_REQUEST = re.compile(
-    f"(?:{_CMD_PREFIX}{_CMD_VERB}\\s+{_CMD_OBJECT}|{_IS_CORRECT})"
-    r"(?=\s|$)"
-)
-
-
-def parse_correction_request(message):
-    """
-    Returns (kind, sentence):
-      ("command", "")      "Can you check my englsih?"
-      ("inline", sentence) "Check my English: Yesterday I go home"
-      ("none", "")         everything else (normal conversation)
-    """
-    tokens = str(message or "").replace("’", "'").split()
-
-    kept = []  # (index in original tokens, normalised word)
-    for index, token in enumerate(tokens):
-        word = _fix_typo(token.lower().strip(".,;:!?\"'()-"))
-        if word:
-            kept.append((index, word))
-
-    normalized = " ".join(word for _, word in kept)
-    if not normalized:
-        return "none", ""
-
-    if any(p.fullmatch(normalized) for p in _COMMAND_ONLY_PATTERNS):
-        return "command", ""
-
-    match = _INLINE_REQUEST.match(normalized)
-    if not match:
-        return "none", ""
-
-    consumed = len(match.group(0).split())
-    if consumed >= len(kept):
-        return "command", ""
-
-    sentence = " ".join(tokens[kept[consumed][0]:]).strip()
-    if len(sentence.split()) >= 2:
-        return "inline", sentence
-
-    return "none", ""
-
-
-def is_grammar_command_only(message):
-    """Standalone request to check/correct English (no sentence attached)."""
-    return parse_correction_request(message)[0] == "command"
-
-
-_PRACTICE_PATTERNS = [
-    re.compile(p) for p in (
-        r"\bpractice\s+(?:english\s+)?grammar\b",
-        r"\bgrammar\s+exercises?\b",
-        r"\benglish\s+grammar\s+practice\b",
-        r"\btest\s+my\s+grammar\b",
-        r"\bquiz\s+me\s+on\s+grammar\b",
-    )
-]
-
-
-def is_practice_request(message):
-    text = normalize_intent_text(message)
-    return any(p.search(text) for p in _PRACTICE_PATTERNS)
-
-
 def detect_message_intent(message, history=None):
-    """'learn' only for explicit correction/practice requests, else 'chat'.
-    Kept for compatibility; chat() uses parse_correction_request() directly."""
-    if parse_correction_request(message)[0] != "none":
-        print("[INTENT RULE] Explicit correction request")
-        return "learn"
+    """
+    Ask the local Ollama model whether the user is chatting or
+    explicitly practising English. Falls back to simple rules if Ollama
+    is unavailable or returns an invalid label.
+    """
+    fallback = fallback_message_intent(message)
 
-    if is_practice_request(message):
-        print("[INTENT RULE] Grammar practice")
-        return "learn"
+    history_text = ""
+    if history:
+        history_text = "\n".join(
+            f"{'User' if row['role'] == 'user' else 'Tutor'}: {row['message']}"
+            for row in history[-4:]
+        )
 
-    print("[INTENT RULE] Friendly conversation")
-    return "chat"
+    prompt = f"""
+Classify the user's message for an English-learning app.
+Return exactly one word: CHAT or LEARN.
 
+CHAT means:
+- The user is asking an ordinary question or wants an answer.
+- The user is greeting, joking, chatting, venting, using slang, or being rude.
+- The user asks about the app, the AI, everyday life, or any general topic.
+- The user has not explicitly asked for correction or a grammar exercise.
+- Do NOT classify something as LEARN merely because the English has mistakes.
 
-def find_previous_student_sentence(history):
-    """Most recent real student sentence. Assumes OLDEST-FIRST history."""
-    for row in reversed(history or []):
-        if row["role"] != "user":
-            continue
+LEARN means:
+- The user explicitly asks to correct/check/improve a sentence or grammar.
+- The user asks for a grammar explanation or an English exercise.
+- The user appears to be submitting a practice sentence for correction.
 
-        text = str(row["message"]).strip()
+Examples:
+Message: "Can you help me with some grammar topics?"
+CHAT
+Message: "Why are you not understanding me?"
+CHAT
+Message: "Who made this platform?"
+CHAT
+Message: "Are you crazy?"
+CHAT
+Message: "Someone called me a bad name."
+CHAT
+Message: "Correct this sentence: he go to school."
+LEARN
+Message: "He go to school every day." 
+LEARN
+Message: "Please check my English: I am studing AI."
+LEARN
 
-        if len(text.split()) < 2:
-            continue
-        if parse_correction_request(text)[0] != "none":
-            continue
-        if is_practice_request(text):
-            continue
+Recent context:
+{history_text}
 
-        return text
+Current message:
+{message}
 
-    return ""
+Label:"""
 
+    try:
+        payload = json.dumps({
+            "model": "qwen2.5:1.5b",
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "10m",
+            "options": {
+                "num_predict": 3,
+                "temperature": 0
+            }
+        }).encode("utf-8")
 
-# ------------------------------------------------------------
-# Ollama helper + correction explanation
-# ------------------------------------------------------------
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
 
-def _trim_to_sentence(reply):
-    reply = " ".join(str(reply or "").split())
-    if reply and reply[-1] not in ".!?":
-        last = max(reply.rfind("."), reply.rfind("!"), reply.rfind("?"))
-        if last > 0:
-            reply = reply[:last + 1]
-    return reply
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
+        label = result.get("response", "").strip().upper()
+        if re.search(r"\bCHAT\b", label):
+            return "chat"
+        if re.search(r"\bLEARN\b", label):
+            return "learn"
 
-def _ollama_chat(messages, num_predict, temperature, timeout=60):
-    payload = json.dumps({
-        "model": "qwen2.5:1.5b",
-        "messages": messages,
-        "stream": False,
-        "keep_alive": "30m",
-        "options": {
-            "num_predict": num_predict,
-            "num_ctx": 1024,
-            "temperature": temperature,
-            "num_thread": 4
-        }
-    }).encode("utf-8")
+    except Exception as e:
+        print("INTENT DETECTION FALLBACK:", repr(e))
 
-    request = urllib.request.Request(
-        "http://localhost:11434/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
-    started = time.perf_counter()
-
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read().decode("utf-8"))
-
-    print(
-        f"[SPEED TEST] Ollama HTTP total: "
-        f"{time.perf_counter() - started:.2f}s"
-    )
-    print("[OLLAMA METRICS]", {
-        "total_seconds": round(result.get("total_duration", 0) / 1e9, 2),
-        "load_seconds": round(result.get("load_duration", 0) / 1e9, 2),
-        "prompt_tokens": result.get("prompt_eval_count"),
-        "generated_tokens": result.get("eval_count"),
-    })
-
-    return str(result.get("message", {}).get("content", "")).strip()
-
-
-def describe_word_changes(original, corrected):
-    """Exact word-level differences, computed without the model."""
-    a, b = original.split(), corrected.split()
-    parts = []
-    matcher = difflib.SequenceMatcher(None, a, b)
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        old, new = " ".join(a[i1:i2]), " ".join(b[j1:j2])
-        if tag == "replace":
-            parts.append(f"'{old}' → '{new}'")
-        elif tag == "delete":
-            parts.append(f"remove '{old}'")
-        elif tag == "insert":
-            parts.append(f"add '{new}'")
-
-    return parts
-
-
-def build_correction_reply(original, corrected, has_errors):
-    if not has_errors:
-        return f"Great! Your sentence is correct: {corrected}"
-
-    changes = describe_word_changes(original, corrected)
-    lines = [f"Corrected sentence: {corrected}"]
-
-    if changes:
-        lines.append("Changes: " + "; ".join(changes))
-
-        try:
-            tip = _ollama_chat(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an English teacher for beginners. "
-                            "Explain the grammar rule behind the listed "
-                            "changes in ONE short sentence (maximum 25 "
-                            "words). Explain only the listed changes. "
-                            "Do not suggest anything else."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f'Original: "{original}"\n'
-                            f'Corrected: "{corrected}"\n'
-                            f"Changes: {'; '.join(changes)}\n"
-                            "Explain the rule."
-                        )
-                    }
-                ],
-                num_predict=60,
-                temperature=0.1
-            )
-            tip = _trim_to_sentence(tip)
-            if tip:
-                lines.append(f"Tip: {tip}")
-        except Exception as error:
-            print("[EXPLAIN ERROR]", repr(error))
-
-    return "\n".join(lines)
-
-
-# ------------------------------------------------------------
-# Natural conversation (never corrects grammar)
-# ------------------------------------------------------------
-
-_CHAT_SYSTEM_PROMPT = (
-    "You are a friendly AI English tutor chatting with a student who is "
-    "learning English. You are a computer program, not a human: you have "
-    "no body, family or personal life. "
-    "Reply to what the student actually said, in 1 or 2 short, simple, "
-    "natural sentences (maximum 30 words). "
-    "Do NOT correct grammar or mention mistakes. "
-    "If the student asks whether or who made you, say you are an AI tutor "
-    "program built for this app and that you do not know more details. "
-    "If the message is unclear or may contain a typo, say what you think "
-    "they mean and ask them to confirm. "
-    "Never say 'How can I assist you' or 'I'm here to help'. "
-    "Never invent facts. Ask a short follow-up question only when it fits.\n"
-    "Example (style only): Student: are you made / "
-    "Tutor: Do you mean 'Who made you?' I'm an AI tutor program built "
-    "for this app. What shall we talk about?"
-)
+    return fallback
 
 
 def generate_natural_chat_reply(message, history=None):
-    started = time.perf_counter()
-    text = " ".join(str(message or "").split())
-
-    if not text:
-        return "I'm listening! Tell me a little more."
-
-    messages = [
-        {"role": "system", "content": _CHAT_SYSTEM_PROMPT}
-    ]
-
-    # Keep only the latest 2 conversation messages.
-    for row in (history or [])[-2:]:
-        content = str(row["message"]).strip()
-
-        if row["role"] == "assistant" and content.startswith(
-            ("Corrected sentence:", "Great! Your sentence is correct")
-        ):
-            continue
-
-        messages.append({
-            "role": (
-                "user"
-                if row["role"] == "user"
-                else "assistant"
-            ),
-            "content": content[:120]
-        })
-
-    messages.append({
-        "role": "user",
-        "content": text[:300]
-    })
-
-    try:
-        reply = _trim_to_sentence(
-            _ollama_chat(
-                messages,
-                num_predict=32,
-                temperature=0.5
-            )
+    """Answer the user naturally. Never add unsolicited grammar correction."""
+    history_text = ""
+    if history:
+        history_text = "\n".join(
+            f"{'User' if row['role'] == 'user' else 'AI Tutor'}: {row['message']}"
+            for row in history[-6:]
         )
 
+    prompt = f"""
+You are the friendly conversational assistant inside an AI Language Coach app.
+Reply naturally to what the user actually means, in simple English.
+Do not correct grammar, spelling, punctuation, or word choice unless the user asks.
+Do not say "Good attempt", "Corrected:", or give grammar feedback during normal chat.
+Answer questions directly. If the user is joking or rude, stay calm and friendly.
+Keep the reply concise (1-3 sentences). Do not pretend to know facts you do not know.
+If asked what this app can teach, mention English grammar, vocabulary, speaking,
+writing, pronunciation and everyday conversation only as available features if relevant.
+If asked who made this particular app, explain that it is the user's AI Language Coach project;
+do not claim that OpenAI made this specific app.
+
+Recent conversation:
+{history_text}
+
+User message: {message}
+
+Natural reply:"""
+
+    try:
+        payload = json.dumps({
+            "model": "qwen2.5:1.5b",
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": "10m",
+            "options": {
+                "num_predict": 100,
+                "temperature": 0.4
+            }
+        }).encode("utf-8")
+
+        request = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        reply = result.get("response", "").strip()
         if reply:
-            print(
-                f"[SPEED TEST] Natural chat total: "
-                f"{time.perf_counter() - started:.2f}s"
-            )
             return reply
 
-    except Exception as error:
-        print("[NATURAL CHAT ERROR]", repr(error))
+    except Exception as e:
+        print("NATURAL CHAT ERROR:", repr(e))
 
-    return (
-        "Sorry, I didn't catch that. "
-        "Could you say it in a different way?"
-    )
+    # Helpful fallback if the local chat model is unavailable.
+    if message.strip().endswith("?"):
+        return "That's a good question. I'll do my best to help—could you tell me a little more about what you mean?"
+    return "I'm listening. Tell me a little more."
 
 
 # ============================================================
@@ -3267,20 +2738,7 @@ def generate_natural_chat_reply(message, history=None):
 # ============================================================
 
 @app.post("/api/chat")
-def chat(
-    data: dict,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    requested_user_id = data.get("user_id")
-
-    if requested_user_id and requested_user_id != authenticated_user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's chat",
-        )
-
+def chat(data: dict):
     chat_start = time.perf_counter()
     message = str(
         data.get(
@@ -3289,7 +2747,10 @@ def chat(
         )
     ).strip()
 
-    user_id = authenticated_user_id
+    user_id = data.get(
+        "user_id",
+        "guest"
+    )
 
     # --------------------------------------------------------
     # Message length
@@ -3363,140 +2824,70 @@ def chat(
             "cards_added": 0
         }
 
-
     # --------------------------------------------------------
-    # Conversation history + single intent routing
+    # Conversation history
     # --------------------------------------------------------
-    history = get_conversation_history(user_id, limit=6)
 
-    # Exactly what the student typed; this is what goes into the chat log.
-    message_to_save = message
-
-    t_intent = time.perf_counter()
-
-    request_kind, inline_sentence = parse_correction_request(message)
-    correction_requested = request_kind in ("command", "inline")
-    practice_requested = (
-        not correction_requested
-        and is_practice_request(message)
+    history = get_conversation_history(
+        user_id,
+        limit=6
     )
-    missing_previous = False
+    # --------------------------------------------------------
+    # Decide whether this is conversation or English practice
+    # --------------------------------------------------------
 
-    if request_kind == "command":
-        # "Can you check my English?" -> previous real student sentence.
-        previous_user_message = find_previous_student_sentence(
-            get_conversation_history(user_id, limit=20)
-        )
-
-        if previous_user_message:
-            message = previous_user_message
-            intent = "learn"
-            print("[INTENT RULE] Correcting previous user sentence")
-        else:
-            intent = "chat"
-            missing_previous = True
-            print("[INTENT RULE] No previous sentence found")
-
-    elif request_kind == "inline":
-        message = inline_sentence
-        intent = "learn"
-        print("[INTENT RULE] Correcting sentence sent with the request")
-
-    elif practice_requested:
-        intent = "learn"
-        print("[INTENT RULE] Grammar practice request")
-
-    else:
-        intent = "chat"
-        print("[INTENT RULE] Friendly conversation")
-
+    intent = detect_message_intent(message, history)
     print("[CHAT INTENT]", intent)
-    print("[CORRECTION REQUEST]", correction_requested)
-    print(
-        f"[SPEED TEST] Intent detection: "
-        f"{time.perf_counter() - t_intent:.2f}s"
-    )
-
-    # --------------------------------------------------------
-    # Natural chat OR English grammar correction
-    # --------------------------------------------------------
 
     if intent == "chat":
-
+        # Normal chat: answer the message and do not run grammar correction.
         final_corrected = message
         natural_confidence = 1.0
         has_errors = False
         error_category = None
         changes = []
-
-        t_reply = time.perf_counter()
-
-        if missing_previous:
-            reply = (
-                "Sure! Write a sentence first, then ask me to check it. "
-                "Or send it together, like: Check my English: "
-                "I go to school yesterday."
-            )
-        else:
-            reply = generate_natural_chat_reply(message, history)
-
-        if not reply:
-            reply = (
-                "Sorry, I didn't catch that. "
-                "Could you say it in a different way?"
-            )
-
-        print(
-            f"[SPEED TEST] Natural chat reply: "
-            f"{time.perf_counter() - t_reply:.2f}s"
-        )
+        reply = generate_natural_chat_reply(message, history)
 
     else:
-        # ----------------------------------------------------
-        # Grammar correction
-        # ----------------------------------------------------
+        # Learning mode: run grammar correction.
+        t1 = time.perf_counter()
+        corrected, changes = correct_grammar_with_ai(message)
 
-        t_grammar = time.perf_counter()
-
-        # For explicit requests `message` is already the bare sentence.
-        grammar_input = message.strip()
-
-        corrected, changes = correct_grammar_with_ai(
-            grammar_input
+        print(
+            f"[SPEED TEST] Grammar: "
+            f"{time.perf_counter() - t1:.2f}s"
         )
 
         final_corrected = corrected
         natural_confidence = 0.95
 
         has_errors = (
-            normalize_grammar_text(grammar_input)
+            normalize_grammar_text(message)
             != normalize_grammar_text(final_corrected)
         )
 
         error_category = None
-
         if has_errors:
             error_category = classify_error_category(
-                grammar_input,
+                message,
                 final_corrected
             )
+            print("FINAL ERROR CATEGORY:", error_category)
 
             if changes:
                 for change in changes:
-                    change["category"] = (
-                        error_category
-                        or change.get("category", "grammar")
+                    change["category"] = error_category or change.get(
+                        "category", "grammar"
                     )
-                    change["from"] = grammar_input
+                    change["from"] = message
                     change["to"] = final_corrected
             else:
                 changes = [{
                     "category": error_category or "grammar",
                     "type": "replace",
-                    "from": grammar_input,
+                    "from": message,
                     "to": final_corrected
                 }]
-
         else:
             changes = []
 
@@ -3504,46 +2895,30 @@ def chat(
             for change in changes:
                 topic_id = detect_learning_topic(
                     change.get("category", "grammar"),
-                    grammar_input,
+                    message,
                     final_corrected
                 )
                 record_learning_error(user_id, topic_id)
 
-        if correction_requested:
-            # Corrected sentence + exact changes + short rule.
-            reply = build_correction_reply(
-                grammar_input,
-                final_corrected,
-                has_errors
-            )
-        else:
-            # Grammar-practice request: existing behaviour, unchanged.
-            t_tutor = time.perf_counter()
-
-            reply = generate_local_tutor_response(
-                grammar_input,
-                final_corrected,
-                history
-            )
-
-            print(
-                f"[SPEED TEST] Tutor reply: "
-                f"{time.perf_counter() - t_tutor:.2f}s"
-            )
-
+        t1 = time.perf_counter()
+        reply = generate_local_tutor_response(
+            message,
+            final_corrected,
+            history
+        )
         print(
-            f"[SPEED TEST] Grammar correction: "
-            f"{time.perf_counter() - t_grammar:.2f}s"
+            f"[SPEED TEST] Tutor reply: "
+            f"{time.perf_counter() - t1:.2f}s"
         )
 
     # --------------------------------------------------------
-    # Save conversation (the student's real message)
+    # Save conversation
     # --------------------------------------------------------
 
     save_conversation_message(
         user_id,
         "user",
-        message_to_save
+        message
     )
 
     save_conversation_message(
@@ -3553,15 +2928,15 @@ def chat(
     )
 
     # --------------------------------------------------------
-    # Extract memory (skip bare commands such as "check my English")
+    # Extract memory
     # --------------------------------------------------------
 
-    if request_kind != "command":
-        memory_executor.submit(
-            extract_student_memory,
-            user_id,
-            message
-        )
+    memory_executor.submit(
+    extract_student_memory,
+    user_id,
+    message
+    )
+    
 
     if intent == "learn":
         # --------------------------------------------------------
@@ -3588,6 +2963,10 @@ def chat(
             )
 
             attempt_id = cur.lastrowid
+
+            # ----------------------------------------------------
+            # Save errors
+            # ----------------------------------------------------
 
             for change in changes:
 
@@ -3689,380 +3068,6 @@ def chat(
         "cards_added": 0
     }
 
-
-
-# ============================================================
-# DAILY SPEAKING PRACTICE API
-# Separate feedback endpoint - does not save chat history
-# ============================================================
-
-@app.post("/api/speaking-feedback")
-def daily_speaking_feedback(
-    data: dict,
-    authorization: str | None = Header(default=None),
-):
-
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    requested_user_id = str(data.get("user_id", "")).strip()
-
-    if requested_user_id and requested_user_id != authenticated_user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's speaking feedback",
-        )
-
-    user_id = authenticated_user_id
-
-    import re
-
-    text = str(data.get("text", "")).strip()
-
-    if not text:
-        raise HTTPException(
-            status_code=400,
-            detail="Please speak first, then request feedback."
-        )
-
-
-    if len(text) > 5000:
-        raise HTTPException(
-            status_code=400,
-            detail="Transcript is too long. Please keep it under 5000 characters."
-        )
-
-    try:
-        prompt = f"""
-You are a careful, friendly English teacher helping a student
-improve spoken English.
-
-Analyze the student's transcript below.
-
-STUDENT TRANSCRIPT:
-{text}
-
-GRAMMAR CORRECTION RULES:
-
-1. Check every sentence in the original transcript separately.
-2. Compare every original sentence with its corrected version.
-3. If a sentence has a grammar mistake, include it in the corrections list.
-4. Never omit a correction that appears in corrected_text.
-5. The original field must contain the exact original sentence.
-6. The corrected field must contain the corrected version of that sentence.
-7. Use category "grammar" for grammar mistakes.
-8. Do not mark a correct sentence as incorrect.
-9. For "Yesterday I go to university.", use
-   "Yesterday I went to university."
-10. For "I am study artificial intelligence.", use
-    "I am studying artificial intelligence."
-11. "Yesterday I went to university" uses the simple past tense,
-    not the past perfect tense.
-12. Return valid JSON only, following the required JSON structure.
-
-FEEDBACK ACCURACY RULES:
-
-1. Give advice based only on the student's actual mistakes.
-2. Never claim that the student corrected a mistake unless the corrected text confirms it.
-3. Do not recommend past perfect tense unless the sentence genuinely requires it.
-4. "Yesterday I went to university" uses simple past tense, not past perfect.
-5. Do not suggest "studies" as a replacement for "study" unless the sentence structure requires it.
-6. Keep feedback short, accurate, friendly, and suitable for an English beginner.
-7. The practice sentence must teach the same grammar rule that the student got wrong.
-8. Do not invent vocabulary mistakes or unnecessary grammar lessons.
-
-
-Return valid JSON only, using this structure:
-{{
-  "corrected_text": "Complete corrected transcript",
-  "corrections": [
-    {{
-      "original": "Original incorrect phrase",
-      "corrected": "Correct phrase",
-      "category": "grammar"
-    }}
-  ],
-  "overall_feedback": "One or two sentences of specific feedback",
-  "vocabulary_suggestion": "One useful word or phrase and its meaning",
-  "fluency_tip": "One practical speaking exercise",
-  "practice_sentence": "One short sentence to practise"
-}}
-
-The corrections array must contain only real, meaningful corrections.
-The original and corrected phrases must come from the student's transcript
-and its corrected version. Do not invent mistakes.
-"""
-
-        payload = {
-    "model": "qwen2.5:1.5b",
-    "prompt": prompt,
-    "stream": False,
-    "keep_alive": "30m",
-    "options": {
-        "num_thread": 4,
-        "num_predict": 60,
-    },}.encode("utf-8")
-
-        request = urllib.request.Request(
-            "http://localhost:11434/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-
-        with urllib.request.urlopen(
-            request, timeout=90
-        ) as response:
-            model_result = json.loads(
-                response.read().decode("utf-8")
-            )
-
-        raw_result = model_result.get("response", "").strip()
-
-        if not raw_result:
-            raise ValueError("The AI returned an empty response.")
-
-        ai_data = json.loads(raw_result)
-
-        corrected_text = str(
-            ai_data.get("corrected_text", "")
-        ).strip()
-
-        if not corrected_text:
-            corrected_text = text
-
-    
-        # Split original and corrected text into sentences.
-        def split_sentences(value):
-            return [
-                part.strip()
-                for part in re.split(
-                    r'(?<=[.!?])\s+|\n+',
-                    value
-                )
-                if part.strip()
-            ]
-
-        original_sentences = split_sentences(text)
-        corrected_sentences = split_sentences(corrected_text)
-
-        if not original_sentences and text:
-            original_sentences = [text]
-
-        if not corrected_sentences and corrected_text:
-            corrected_sentences = [corrected_text]
-
-        # Fix common grammar patterns reliably.
-        known_fixes = {
-            "yesterday i go to university.":
-                "Yesterday I went to university.",
-            "i am study artificial intelligence.":
-                "I am studying artificial intelligence."
-        }
-
-        original_parts = [
-            part.strip()
-            for part in re.split(
-                r'(?<=[.!?])\s+|\n+',
-                text
-            )
-            if part.strip()
-        ]
-
-        fixed_parts = []
-
-        for sentence in original_parts:
-            replacement = known_fixes.get(sentence.casefold())
-
-            if replacement:
-                fixed_parts.append(replacement)
-            else:
-                fixed_parts.append(sentence)
-
-        corrected_text = " ".join(fixed_parts)
-
-        # Split original and corrected text into sentences.
-        def split_sentences(value):
-            return [
-                part.strip()
-                for part in re.split(
-                    r'(?<=[.!?])\s+|\n+',
-                    value
-                )
-                if part.strip()
-            ]
-
-        original_sentences = split_sentences(text)
-        corrected_sentences = split_sentences(corrected_text)
-
-        # Fallback for text without punctuation.
-        if not original_sentences and text:
-            original_sentences = [text]
-
-        if not corrected_sentences and corrected_text:
-            corrected_sentences = [corrected_text]
-
-        # Build corrections by comparing sentence pairs.
-        corrections = []
-
-        def normalize(sentence):
-            return re.sub(
-                r"\s+", " ", sentence
-            ).strip().casefold()
-
-        if len(original_sentences) == len(corrected_sentences):
-            for original, corrected in zip(
-                original_sentences,
-                corrected_sentences
-            ):
-                if normalize(original) != normalize(corrected):
-                    corrections.append({
-                        "original": original,
-                        "corrected": corrected,
-                        "category": "grammar"
-                    })
-        else:
-            # Fallback to corrections returned by Ollama.
-            ai_corrections = ai_data.get("corrections", [])
-
-            if isinstance(ai_corrections, list):
-                for item in ai_corrections:
-                    if not isinstance(item, dict):
-                        continue
-
-                    original = str(
-                        item.get("original", "")
-                    ).strip()
-
-                    corrected = str(
-                        item.get("corrected", "")
-                    ).strip()
-
-                    if (
-                        original
-                        and corrected
-                        and normalize(original) != normalize(corrected)
-                    ):
-                        corrections.append({
-                            "original": original,
-                            "corrected": corrected,
-                            "category": str(
-                                item.get("category", "grammar")
-                            )
-                        })
-
-        corrections = corrections[:30]
-
-        # Calculate grammar score.
-        total_sentences = len(original_sentences)
-        error_count = len(corrections)
-              
-        # This is an approximate practice score, not a formal assessment.
-        if total_sentences > 0:
-            grammar_score = round(
-                100 * (total_sentences - error_count)
-                / total_sentences
-            )
-            grammar_score = max(0, min(100, grammar_score))
-        else:
-            grammar_score = 0
-
-        overall = str(
-            ai_data.get("overall_feedback", "")
-        ).strip() or "Thank you for practising. Keep improving one sentence at a time."
-
-        vocabulary = str(
-            ai_data.get("vocabulary_suggestion", "")
-        ).strip() or "Learn one useful English phrase and practise using it."
-
-        fluency = str(
-            ai_data.get("fluency_tip", "")
-        ).strip() or "Speak in short sentences and pause naturally between ideas."
-
-        practice = str(
-            ai_data.get("practice_sentence", "")
-        ).strip() or "I am improving my English every day."
-
-        feedback = (
-            f"Overall feedback: {overall}\n\n"
-            f"Vocabulary: {vocabulary}\n\n"
-            f"Fluency tip: {fluency}\n\n"
-            f"Practice sentence: {practice}"
-        )
-
-        
-        # Save speaking attempt and grammar errors.
-        import sqlite3
-        from datetime import datetime
-
-        db_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "tutor.db"
-        )
-
-        conn = sqlite3.connect(db_path)
-
-        try:
-            cursor = conn.cursor()
-
-            cursor.execute(
-                """
-                INSERT INTO attempts
-                (user_id, ts, original, corrected, has_errors)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    datetime.now().isoformat(timespec="seconds"),
-                    text,
-                    corrected_text,
-                    1 if error_count > 0 else 0
-                )
-            )
-
-            attempt_id = cursor.lastrowid
-
-            for item in corrections:
-                cursor.execute(
-                    """
-                    INSERT INTO errors
-                    (attempt_id, user_id, category, from_text, to_text)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        attempt_id,
-                        user_id,
-                        item["category"],
-                        item["original"],
-                        item["corrected"]
-                    )
-                )
-
-            conn.commit()
-
-        finally:
-            conn.close()
-
-        return {
-            "success": True,
-            "transcript": text,
-            "corrected_text": corrected_text,
-            "corrections": corrections,
-            "grammar_score": grammar_score,
-            "total_sentences": total_sentences,
-            "error_count": error_count,
-            "feedback": feedback
-        }
-
-    except Exception as e:
-        print("DAILY SPEAKING FEEDBACK ERROR:", repr(e))
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Unable to generate speaking feedback. "
-                "Check that Ollama is running and qwen2.5:1.5b is available."
-            )
-        )
 
 # ============================================================
 # PROFILE
@@ -4247,17 +3252,7 @@ def get_profile_data(user_id):
 # ============================================================
 
 @app.get("/api/learning-path/{user_id}")
-def get_learning_path(
-    user_id: str,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's learning path",
-        )
+def get_learning_path(user_id: str):
 
     conn = get_db()
 
@@ -4451,17 +3446,7 @@ def get_learning_path(
 # ============================================================
 
 @app.get("/api/next-lesson/{user_id}")
-def get_next_lesson(
-    user_id: str,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's next lesson",
-        )
+def get_next_lesson(user_id: str):
 
     conn = get_db()
 
@@ -4646,16 +3631,8 @@ def get_lesson(lesson_id: int):
 @app.get("/api/lesson-progress/{user_id}/{lesson_id}")
 def get_lesson_progress(
     user_id: str,
-    lesson_id: int,
-    authorization: str | None = Header(default=None),
+    lesson_id: int
 ):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's lesson progress",
-        )
 
     conn = get_db()
 
@@ -4739,21 +3716,90 @@ def get_lesson_progress(
 # PRACTICE SUBMISSION
 # ============================================================
 
+# ============================================================
+# PRACTICE SUBMISSION
+# ============================================================
 
 @app.post("/api/lesson-practice/{user_id}/{lesson_id}")
 def submit_lesson_practice(
     user_id: str,
     lesson_id: int,
-    answer: int,
-    authorization: str | None = Header(default=None),
+    answer: int
 ):
-    authenticated_user_id = get_authenticated_user_id(authorization)
 
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot submit practice for another user",
+    conn = get_db()
+
+    try:
+
+        lesson = conn.execute(
+            """
+            SELECT practice_answer
+            FROM lessons
+            WHERE id = ?
+            """,
+            (lesson_id,)
+        ).fetchone()
+
+        if not lesson:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Lesson not found"
+            )
+
+
+        correct = (
+            answer == lesson["practice_answer"]
         )
+
+
+        if correct:
+
+            conn.execute(
+                """
+                INSERT INTO student_lessons
+                (
+                    user_id,
+                    lesson_id,
+                    practice_completed,
+                    quiz_score,
+                    completed
+                )
+                VALUES (?, ?, 1, 0, 0)
+
+                ON CONFLICT(user_id, lesson_id)
+                DO UPDATE SET
+                    practice_completed = 1
+                """,
+                (
+                    user_id,
+                    lesson_id
+                )
+            )
+
+            conn.commit()
+
+
+        return {
+            "correct": correct,
+            "practice_completed": correct
+        }
+
+
+    finally:
+
+        conn.close()
+
+# ============================================================
+# PRACTICE SUBMISSION
+# ============================================================
+
+@app.post("/api/lesson-practice/{user_id}/{lesson_id}")
+def submit_lesson_practice(
+    user_id: str,
+    lesson_id: int,
+    answer: int
+):
 
     conn = get_db()
 
@@ -4816,16 +3862,8 @@ def submit_lesson_practice(
 def submit_lesson_quiz(
     user_id: str,
     lesson_id: int,
-    answer: int,
-    authorization: str | None = Header(default=None),
+    answer: int
 ):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot submit a quiz for another user",
-        )
 
     conn = get_db()
 
@@ -4921,36 +3959,16 @@ def submit_lesson_quiz(
 # PROFILE API
 # ============================================================
 
-
 @app.get("/api/profile/{user_id}")
-def profile(
-    user_id: str,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
+def profile(user_id: str):
 
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's profile",
-        )
-
-    return get_profile_data(user_id)
-
+    return get_profile_data(
+        user_id
+    )
 
 
 @app.delete("/api/profile/{user_id}")
-def delete_profile(
-    user_id: str,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot delete another user's profile",
-        )
+def delete_profile(user_id: str):
 
     conn = get_db()
 
@@ -5097,17 +4115,7 @@ EXERCISES = [
 
 
 @app.get("/api/exercise/{user_id}")
-def get_exercise(
-    user_id: str,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's exercise",
-        )
+def get_exercise(user_id: str):
 
     exercise = EXERCISES[
         0
@@ -5128,21 +4136,12 @@ def get_exercise(
 
 
 @app.post("/api/exercise/answer")
-def exercise_answer(
-    data: dict,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
+def exercise_answer(data: dict):
 
-    requested_user_id = data.get("user_id")
-
-    if requested_user_id and requested_user_id != authenticated_user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot submit answers for another user",
-        )
-
-    user_id = authenticated_user_id
+    user_id = data.get(
+        "user_id",
+        "guest"
+    )
 
     exercise_id = int(
         data.get(
@@ -5221,17 +4220,7 @@ def exercise_answer(
 # ============================================================
 
 @app.get("/api/review/{user_id}")
-def review(
-    user_id: str,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
-
-    if authenticated_user_id != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot access another user's review",
-        )
+def review(user_id: str):
 
     conn = get_db()
 
@@ -5304,21 +4293,12 @@ def review(
 
 
 @app.post("/api/review/answer")
-def review_answer(
-    data: dict,
-    authorization: str | None = Header(default=None),
-):
-    authenticated_user_id = get_authenticated_user_id(authorization)
+def review_answer(data: dict):
 
-    requested_user_id = data.get("user_id")
-
-    if requested_user_id and requested_user_id != authenticated_user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="You cannot submit review answers for another user",
-        )
-
-    user_id = authenticated_user_id
+    user_id = data.get(
+        "user_id",
+        "guest"
+    )
 
     card_id = int(
         data.get("card_id")
@@ -5411,11 +4391,8 @@ def review_answer(
 
 @app.post("/api/transcribe")
 async def transcribe(
-    file: UploadFile = File(...),
-    authorization: str | None = Header(default=None),
+    file: UploadFile = File(...)
 ):
-    get_authenticated_user_id(authorization)
-
     temp_path = None
     t0 = time.perf_counter()
 

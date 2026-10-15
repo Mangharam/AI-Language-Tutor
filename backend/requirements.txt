@@ -1,0 +1,6 @@
+fastapi
+openai
+pwdlib[argon2]
+python-multipart
+python-dotenv
+uvicorn
