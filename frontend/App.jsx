@@ -3,7 +3,7 @@ import "./App.css";
 import FormattedReply from "./FormattedReply";
 import { toSpeechText } from "./replyUtils";
 
-const API_BASE = import.meta.env.DEV ? "http://127.0.0.1:8010" : "";
+const API_BASE = import.meta.env.DEV ? "http://127.0.0.1:8020" : "";
 
 const GREETING = {
   role: "tutor",
