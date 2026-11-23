@@ -27,3 +27,5 @@ node_modules/
 # Temporary audio test files
 kokoro_test.wav
 kokoro_api_test.wav
+backend/google-credentials-old/
+*.webm

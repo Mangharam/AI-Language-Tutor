@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
+import FormattedReply from "./FormattedReply";
+import { toSpeechText } from "./replyUtils";
 
 const API_BASE = import.meta.env.DEV ? "http://127.0.0.1:8010" : "";
 
 const GREETING = {
   role: "tutor",
   reply:
-    "Hello! Write me a sentence in English and I will check your grammar. Try telling me about your day.",
+    "Hello! Write me a sentence or ask me anything about English. You can also tap 'Customer support interview' to practise a mock interview.",
 };
 
 /* =========================================================
@@ -43,11 +45,37 @@ async function apiFetch(path, options = {}) {
     headers.Authorization = `Bearer ${token}`;
   }
 
-  return fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers,
   });
+
+  if (res.status === 401 && token) {
+    localStorage.removeItem("lt_token");
+    localStorage.removeItem("lt_auth_user");
+    window.location.reload();
+  }
+
+  return res;
 }
+function errorText(data, status) {
+  const d = data?.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d) && d[0]?.msg) return d[0].msg;
+  return `Request failed (${status})`;
+}
+
+// Like apiFetch, but throws an Error with the server's message when !ok.
+async function chatFetch(path, options) {
+  const res = await apiFetch(path, options);
+  if (!res.ok) {
+    let data = null;
+    try { data = await res.json(); } catch { /* not JSON */ }
+    throw new Error(errorText(data, res.status));
+  }
+  return res;
+}
+
 async function post(path, body) {
   const response = await apiFetch(path, {
     method: "POST",
@@ -444,7 +472,7 @@ function ChatView({
                   : "You"}
               </div>
 
-              <p>{m.reply}</p>
+              <FormattedReply text={m.reply} />
 
               {m.role === "tutor" && (
                 <Correction msg={m} />
@@ -491,6 +519,25 @@ function ChatView({
       </div>
 
       <div className="composer-wrap">
+        <div className="quick-chips">
+          {[
+            {
+              label: "Customer support interview",
+              text: "I have a job interview for a customer support position. Act as my interviewer and ask one question at a time.",
+            },
+            { label: "End interview", text: "End interview" },
+          ].map((a) => (
+            <button
+              key={a.label}
+              type="button"
+              disabled={loading}
+              onClick={() => send(a.text)}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+
         <div className="composer">
           <input
             value={input}
@@ -576,7 +623,7 @@ function Speaking({ voice, spokenText }) {
   const [voiceLoading, setVoiceLoading] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const [aiReply, setAiReply] = useState("");
-  const previousSpokenText = useRef("");
+  const handledId = useRef(spokenText?.id ?? 0);
   const requestInProgress = useRef(false);
 /* =========================================================
    PLAY AI VOICE - OPTIMIZED
@@ -747,7 +794,7 @@ async function speakWithKokoro(text) {
 
       console.log("AI reply received:", result.reply);
       setAiReply(result.reply);
-      await speakWithKokoro(result.reply);
+      await speakWithKokoro(toSpeechText(result.reply));
     } catch (error) {
       console.error("Speaking practice error:", error);
 
@@ -765,14 +812,12 @@ async function speakWithKokoro(text) {
   ========================================================= */
 
   useEffect(() => {
-    const text = spokenText?.trim();
-
-    if (!text || text === previousSpokenText.current) {
+    if (!spokenText || spokenText.id === handledId.current) {
       return;
     }
 
-    previousSpokenText.current = text;
-    getFeedback(text);
+    handledId.current = spokenText.id;
+    getFeedback(spokenText.text);
   }, [spokenText]);
 
   /* =========================================================
@@ -860,7 +905,7 @@ async function speakWithKokoro(text) {
         {aiReply && (
         <div className="speaking-feedback">
         <div className="eyebrow">AI TUTOR RESPONSE</div>
-         <p>{aiReply}</p>
+         <FormattedReply text={aiReply} />
   </div>
 )}
       </div>
@@ -4216,6 +4261,7 @@ const response = await apiFetch("/api/speaking-feedback", {
           </div>
 
           <div className="daily-feedback-section">
+            {result.warning && <p className="daily-error">{result.warning}</p>}
             <h3>Corrected version</h3>
             <p>{result.corrected_text}</p>
           </div>
@@ -4228,6 +4274,9 @@ const response = await apiFetch("/api/speaking-feedback", {
                 <div className="daily-correction" key={index}>
                   <p className="daily-original">{item.original}</p>
                   <p className="daily-corrected">{item.corrected}</p>
+                  {item.explanation && (
+                    <p className="daily-explanation">{item.explanation}</p>
+                  )}
                 </div>
               ))}
             </div>
@@ -5316,8 +5365,7 @@ useEffect(() => {
   const [profile, setProfile] =
     useState(null);
 
-  const [speakingText, setSpeakingText] =
-    useState("");
+  const [speakingText, setSpeakingText] = useState(null);
 
   const [tab, setTab] =
     useState("dashboard");
@@ -5335,6 +5383,23 @@ useEffect(() => {
   const [voiceText, setVoiceText] =
     useState("");
 
+  // Reload the saved conversation (so an active interview question is visible after refresh).
+  useEffect(() => {
+    apiFetch("/api/chat/history?limit=30")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.messages?.length) {
+          setMessages(
+            d.messages.map((x) => ({
+              role: x.role === "user" ? "user" : "tutor",
+              reply: x.message,
+            }))
+          );
+        }
+      })
+      .catch(() => {});
+  }, [userId]);
+
   /* =====================================================
      VOICE
   ===================================================== */
@@ -5346,7 +5411,7 @@ const voice = useVoice((text, words) => {
   setInput(text);
   setVoiceText(text);
   setVoiceWords(words);
-  setSpeakingText(text);
+  setSpeakingText({ text, id: Date.now() });
 });
 
 
@@ -5413,8 +5478,8 @@ const voice = useVoice((text, words) => {
      SEND CHAT
   ===================================================== */
 
-  async function send() {
-    const text = input.trim();
+  async function send(overrideText) {
+    const text = (typeof overrideText === "string" ? overrideText : input).trim();
 
     if (!text || loading) {
       return;
@@ -5437,7 +5502,7 @@ const voice = useVoice((text, words) => {
 
     try {
       const res =
-        await apiFetch(
+        await chatFetch(
           "/api/chat",
           {
             method: "POST",
@@ -5480,14 +5545,16 @@ const voice = useVoice((text, words) => {
           ...data,
         },
       ]);
-    } catch {
+    } catch (err) {
       setMessages((m) => [
         ...m,
         {
           role: "tutor",
 
           reply:
-            "I could not reach the server. Please check your connection and try again.",
+            err instanceof TypeError
+              ? "I could not reach the server. Please check that the backend is running."
+              : `Sorry, something went wrong: ${err.message}`,
         },
       ]);
     } finally {

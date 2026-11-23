@@ -4,6 +4,9 @@ import tempfile
 import json
 import urllib.request
 import re
+import edge_tts
+from fastapi import HTTPException
+from fastapi.responses import Response
 from difflib import SequenceMatcher
 
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +29,10 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from openai import OpenAI
+
+import logging
+logging.basicConfig(level=logging.INFO)
+from ai_services import OllamaError, analyze_transcript, interview_turn, split_sentences
 
 
 # ============================================================
@@ -56,14 +63,14 @@ app = FastAPI(
 
 memory_executor = ThreadPoolExecutor(max_workers=1)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -340,6 +347,15 @@ def login(data: LoginRequest):
             )
 
         token = create_auth_session(conn, user["id"])
+                    
+        conn.execute(
+            """
+            INSERT INTO login_history (user_id, logged_in_at)
+            VALUES (?, ?)
+            """,
+            (user["id"], now()),
+        )
+
         conn.commit()
 
         return {
@@ -387,6 +403,14 @@ def init_conversation_db():
 
     conn = get_db()
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS login_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        logged_in_at TEXT NOT NULL
+    )
+""")
+
     try:
 
         conn.execute(
@@ -414,7 +438,7 @@ def init_conversation_db():
             )
             """
         )
-
+       
         conn.commit()
 
     finally:
@@ -423,6 +447,7 @@ def init_conversation_db():
 
 
 init_conversation_db()
+
 
 # ============================================================
 # LEARNING PATH SYSTEM
@@ -1590,37 +1615,33 @@ def correct_grammar_with_ai(sentence):
 
     try:
         t0 = time.perf_counter()
-        inputs = grammar_tokenizer(
-            "grammar: " + sentence,
-            return_tensors="pt",
-            truncation=True,
-            max_length=256
+        corrected = llm_complete(
+            "Fix only the grammar, spelling and punctuation mistakes in "
+            "the sentence below. Keep the original wording, meaning and "
+            "tense as much as possible. Do not add or remove information. "
+            "If the sentence is already correct, return it unchanged. "
+            "Return ONLY the sentence, with no quotes and no explanation.\n\n"
+            f"Sentence: {sentence}",
+            max_tokens=120,
+            temperature=0,
+            timeout=20,
         )
 
-        
-        outputs = grammar_model.generate(
-        **inputs,
-        max_new_tokens=64,
-        num_beams=1,
-        do_sample=False
-)
-
-
-        corrected = grammar_tokenizer.decode(
-            outputs[0],
-            skip_special_tokens=True
-        ).strip()
+        corrected = re.sub(
+            r"^(corrected|sentence)\s*:\s*",
+            "",
+            corrected,
+            flags=re.IGNORECASE
+        ).strip().strip('"').strip()
 
         if not corrected:
 
             return sentence, []
-
         if (
             normalize_grammar_text(corrected)
             ==
             normalize_grammar_text(sentence)
         ):
-
             return sentence, []
 
         if len(corrected) > max(
@@ -1857,30 +1878,6 @@ Return JSON:
 """
         
        
-        payload = json.dumps({
-            "model": "qwen2.5:1.5b",
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "10m",
-            "options": {
-                "num_predict": 20,
-                "num_ctx": 1024,
-                "temperature": 0,
-                "num_thread": 2
-            }
-        }).encode("utf-8")
-
-
-        request = urllib.request.Request(
-            "http://localhost:11434/api/generate",
-            data=payload,
-            headers={
-                "Content-Type": "application/json"
-            },
-            method="POST"
-        )
-
-
         ollama_start = time.perf_counter()
 
         with urllib.request.urlopen(
@@ -2644,26 +2641,6 @@ Rules:
 
 Tutor:"""
 
-        payload = json.dumps({
-            "model": "qwen2.5:1.5b",
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "10m",
-            "options": {
-                "temperature": 0.5,
-                "num_predict": 100
-            }
-        }).encode("utf-8")
-
-        request = urllib.request.Request(
-            "http://localhost:11434/api/generate",
-            data=payload,
-            headers={
-                "Content-Type": "application/json"
-            },
-            method="POST"
-        )
-
         qwen_start = time.perf_counter()
 
         with urllib.request.urlopen(
@@ -3078,30 +3055,15 @@ def _trim_to_sentence(reply):
 
 
 def _ollama_chat(messages, num_predict, temperature, timeout=60):
-    payload = json.dumps({
-        "model": "qwen2.5:1.5b",
-        "messages": messages,
-        "stream": False,
-        "keep_alive": "30m",
-        "options": {
-            "num_predict": num_predict,
-            "num_ctx": 1024,
-            "temperature": temperature,
-            "num_thread": 4
-        }
-    }).encode("utf-8")
-
-    request = urllib.request.Request(
-        "http://localhost:11434/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-
+    # Name kept so callers do not change; it now calls Groq.
     started = time.perf_counter()
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    reply = llm_chat(
+        messages,
+        max_tokens=max(int(num_predict), 80),
+        temperature=temperature,
+        timeout=timeout,
+    )
 
     print(
         f"[SPEED TEST] Ollama HTTP total: "
@@ -3189,7 +3151,7 @@ _CHAT_SYSTEM_PROMPT = (
     "learning English. You are a computer program, not a human: you have "
     "no body, family or personal life. "
     "Reply to what the student actually said, in 1 or 2 short, simple, "
-    "natural sentences (maximum 30 words). "
+    "natural sentences (maximum 60 words; a little longer only if the student asks for an explanation). "
     "Do NOT correct grammar or mention mistakes. "
     "If the student asks whether or who made you, say you are an AI tutor "
     "program built for this app and that you do not know more details. "
@@ -3215,7 +3177,7 @@ def generate_natural_chat_reply(message, history=None):
     ]
 
     # Keep only the latest 2 conversation messages.
-    for row in (history or [])[-2:]:
+    for row in (history or [])[-6:]:
         content = str(row["message"]).strip()
 
         if row["role"] == "assistant" and content.startswith(
@@ -3229,7 +3191,7 @@ def generate_natural_chat_reply(message, history=None):
                 if row["role"] == "user"
                 else "assistant"
             ),
-            "content": content[:120]
+            "content": content[:300]
         })
 
     messages.append({
@@ -3241,7 +3203,7 @@ def generate_natural_chat_reply(message, history=None):
         reply = _trim_to_sentence(
             _ollama_chat(
                 messages,
-                num_predict=32,
+                num_predict=120,
                 temperature=0.5
             )
         )
@@ -3367,6 +3329,26 @@ def chat(
     # --------------------------------------------------------
     # Conversation history + single intent routing
     # --------------------------------------------------------
+    routed_reply = interview_turn(get_db, user_id, message, now)
+    if routed_reply is not None:
+        save_conversation_message(user_id, "user", message)
+        save_conversation_message(user_id, "assistant", routed_reply)
+        return {
+            "reply": routed_reply,
+            "profile": get_profile_data(user_id),
+            "deltas": {"grammar": 0, "vocab": 0},
+            "accuracy": 100,
+            "correction": {
+                "has_errors": False,
+                "corrected": "",
+                "changes": [],
+                "category": None,
+                "confidence": 1.0,
+            },
+            "highlights": [],
+            "cards_added": 0,
+        }
+
     history = get_conversation_history(user_id, limit=6)
 
     # Exactly what the student typed; this is what goes into the chat log.
@@ -3792,29 +3774,15 @@ The original and corrected phrases must come from the student's transcript
 and its corrected version. Do not invent mistakes.
 """
 
-        payload = {
-    "model": "qwen2.5:1.5b",
-    "prompt": prompt,
-    "stream": False,
-    "keep_alive": "30m",
-    "options": {
-        "num_thread": 4,
-        "num_predict": 60,
-    },}.encode("utf-8")
-
-        request = urllib.request.Request(
-            "http://localhost:11434/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-
-        with urllib.request.urlopen(
-            request, timeout=90
-        ) as response:
-            model_result = json.loads(
-                response.read().decode("utf-8")
+        model_result = {
+            "response": llm_complete(
+                prompt,
+                max_tokens=900,
+                temperature=0.2,
+                json_mode=True,
+                timeout=45,
             )
+        }
 
         raw_result = model_result.get("response", "").strip()
 
@@ -3921,7 +3889,7 @@ and its corrected version. Do not invent mistakes.
                         "category": "grammar"
                     })
         else:
-            # Fallback to corrections returned by Ollama.
+            # Fallback to corrections returned by the AI model.
             ai_corrections = ai_data.get("corrections", [])
 
             if isinstance(ai_corrections, list):
@@ -4053,6 +4021,8 @@ and its corrected version. Do not invent mistakes.
             "feedback": feedback
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("DAILY SPEAKING FEEDBACK ERROR:", repr(e))
 
@@ -7030,7 +7000,70 @@ def initialize_advanced_course():
 
 
 # ============================================================
-# RUN COURSE INITIALIZATION
+# TABLES USED BY THE API BUT NOT CREATED ELSEWHERE
+# (CREATE IF NOT EXISTS: safe on an existing local tutor.db)
+# ============================================================
+
+def init_legacy_tables():
+    conn = get_db()
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                ts TEXT,
+                original TEXT,
+                corrected TEXT,
+                has_errors INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_id INTEGER,
+                user_id TEXT NOT NULL,
+                category TEXT,
+                from_text TEXT,
+                to_text TEXT
+            );
+            CREATE TABLE IF NOT EXISTS cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                sentence TEXT,
+                answer TEXT,
+                due TEXT,
+                reps INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS exercise_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                ts TEXT,
+                exercise_id,
+                category TEXT,
+                level,
+                correct INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS level_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS skills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS speech_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL
+            );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+init_legacy_tables()
+
+
+# ============================================================
+# CHAT HISTORY (added by chat upgrade)
 # ============================================================
 
 initialize_advanced_course()

@@ -1015,3 +1015,10 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 @media (max-width: 420px) {
   .auth-card { padding: 28px 20px 24px; border-radius: 20px; }
 }
+
+/* --- chat upgrade --- */
+.formatted-reply p { margin: 0 0 4px; line-height: 1.5; }
+.formatted-reply .reply-gap { height: 8px; }
+.quick-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.quick-chips button { border-radius: 999px; padding: 6px 14px; cursor: pointer; }
+.daily-explanation { opacity: .75; font-size: .9em; margin: 0 0 8px; }

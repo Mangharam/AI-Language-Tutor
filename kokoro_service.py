@@ -1,4 +1,5 @@
 ﻿import io
+import time
 import torch
 torch.set_num_threads(4)
 import numpy as np
@@ -135,3 +136,6 @@ def generate_speech(data: SpeechRequest):
             status_code=500,
             detail=str(exc)
         )
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8020)
